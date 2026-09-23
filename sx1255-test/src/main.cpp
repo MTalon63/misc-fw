@@ -24,6 +24,8 @@
 #define POWMAN_VREG_CTRL_DISABLE_VOLTAGE_LIMIT true
 
 #define SP_FIFO_SIZE 131072
+#define TX_FIFO_SIZE 131072u
+#define TX_FIFO_MASK (TX_FIFO_SIZE - 1u)
 alignas(4) volatile uint8_t sp_fifo[SP_FIFO_SIZE]
     __attribute__((section(".uninitialized")));
 static volatile uint32_t sp_fifo_head = 0;
@@ -77,14 +79,36 @@ static unsigned long last_binary_rx_ms = 0;
 // Symbol rate
 static uint32_t symbol_rate_hz = 100000u;
 
+// Target CLKIN frequency. The SX1255 FIR-DAC reconstruction filter runs off
+// the internal 32 MHz XOSC, not CLK_IN — its bandwidth is ~600 kHz SSB at
+// 24 taps, adequate for all supported symbol rates. CLK_IN here is used only
+// for the digital I/Q interface and PIO timing.
+static constexpr uint32_t CLKIN_TARGET_HZ = 8000000u;
+
 // Each symbol occupies exactly cycles_per_symbol PIO clock cycles (= CLK_IN
 // cycles) We dynamically calculate this to maximize oversampling without
 // exceeding SX1255 limits (32 MHz clock)
 static uint32_t cycles_per_symbol = 32;
 static uint32_t clkin_hz = 0; // Calculated dynamically
 
-// DSB Filter setting (0 to 15). 0 = 418 kHz, 15 = 659 kHz
+// DSB Filter setting (0 to 31). Formula from datasheet:
+// BW_3dB = 17.15 / (41 - tx_filter_bw) MHz DSB.
+// 0 = 418 kHz DSB / 209 kHz SSB,
+// 15 = 660 kHz DSB / 330 kHz SSB,
+// 31 = 1715 kHz DSB / 858 kHz SSB (maximum).
 static uint8_t filter_bw_val = 0;
+// PLL bandwidth — selected dynamically based on symbol rate
+static uint8_t current_pll_bw = TXFE3_PLL_BW_75kHz;
+
+// Apply symbol rate and recompute derived timing parameters
+static void apply_symbol_rate(uint32_t rate_hz) {
+  symbol_rate_hz = rate_hz;
+  cycles_per_symbol = CLKIN_TARGET_HZ / rate_hz;
+  if (cycles_per_symbol > 512) cycles_per_symbol = 512;
+  cycles_per_symbol &= ~1u;
+  if (cycles_per_symbol < 2) cycles_per_symbol = 2;
+  clkin_hz = symbol_rate_hz * cycles_per_symbol;
+}
 
 // QPSK: Q is aligned with I (0 delay cycles)
 static constexpr uint32_t Q_OFFSET_CYCLES = 0u;
@@ -115,6 +139,9 @@ static SX1255 sx;
 static constexpr uint16_t FRAME_PAYLOAD_BYTES = 1012u;
 static constexpr uint16_t FRAME_CODED_BYTES =
     VCDU_HEADER_SIZE + MPDU_HEADER_SIZE + FRAME_PAYLOAD_BYTES; // 1020
+static constexpr uint16_t FRAME_PARITY_BYTES = 128u;  // RS(255,223) or LDPC parity
+static constexpr uint16_t FRAME_PAYLOAD_LIMIT = 892u;  // FRAME_CODED_BYTES - FRAME_PARITY_BYTES
+static constexpr uint16_t FULL_PACKET_SIZE = 1024u;    // FRAME_CODED_BYTES + ASM_SIZE (4)
 static constexpr uint32_t FRAME_UNCODED_BITS = (uint32_t)FRAME_CODED_BYTES * 8u;
 static constexpr uint32_t FRAME_ENC_BITS = FRAME_UNCODED_BITS * 2u; // rate-1/2
 
@@ -125,7 +152,7 @@ static uint8_t conv_state = 0u;
 static uint32_t frame_counter = 0u;
 
 // Frequency calibration variables
-static double current_freq_hz = 437000000.0;
+static double current_freq_hz = 436500000.0;
 static double freq_offset_hz = 0.0;
 static bool cw_mode = false;
 
@@ -177,7 +204,7 @@ static void save_calibration_to_eeprom(void) {
 
 static void print_help(void) {
   Serial.println("Commands:");
-  Serial.println("  r <rate> - Set symbol rate (1000-4000000 Hz)");
+  Serial.println("  r <rate> - Set symbol rate (1000-5000000 Hz)");
   Serial.println("  s - Start modulation");
   Serial.println("  p - Stop modulation");
   Serial.println("  i - Print current rate");
@@ -209,7 +236,6 @@ static void print_help(void) {
   Serial.println("  ] / [  - Increase/Decrease freq offset by 10 Hz");
   Serial.println("  } / {  - Increase/Decrease freq offset by 1.0 Hz");
   Serial.println("  > / <  - Increase/Decrease freq offset by 0.1 Hz");
-  Serial.println("  X <Hz> - Set SX1255 XTAL frequency (e.g. X 36864000)");
   Serial.println("  g - Cycle SX1255 DAC Gain (0dB, -3dB, -6dB, -9dB)");
   Serial.println("  f - Cycle SX1255 Mixer Gain (0 to -16dB)");
   Serial.println("  K / L  - Increase/Decrease Q Gain Calibration");
@@ -217,16 +243,16 @@ static void print_help(void) {
   Serial.println("  J / j  - Increase/Decrease I DC Offset by 10");
   Serial.println("  C / d  - Increase/Decrease Q DC Offset by 10");
   Serial.println("  z - Toggle CW (Carrier Wave) Calibration Mode");
-  Serial.println("  x - Swap physical I/Q pin routing");
+  Serial.println("  X - Swap physical I/Q pin routing");
   Serial.println("  v / V  - Decrease/Increase Digital DAC Scaling");
-  Serial.println("  b / B  - Decrease/Increase DSB Filter BW");
+  Serial.println("  b / B  - Decrease/Increase DSB Filter BW (0-31)");
   Serial.println("  w - Save current calibrations to EEPROM");
 }
 
 // Diagnostic configuration variables (defined high up for scope visibility)
 static bool swap_iq = false;
 static bool invert_g2 = false; // Default: false
-static bool swap_pins = false; // Default: false (toggled via 'x' command)
+static bool swap_pins = false; // Default: false (toggled via 'X' command)
 static bool use_conv = true;
 static bool use_randomizer = true;
 static bool use_rs = true;
@@ -275,7 +301,7 @@ static void build_vcdu_header(uint8_t *frame, uint8_t vcid) {
 }
 
 // 131072-bit circular buffer for raw output stream
-static uint8_t tx_bit_fifo[131072];
+static uint8_t tx_bit_fifo[TX_FIFO_SIZE];
 static volatile uint32_t tx_fifo_wptr = 0;   // write pointer
 static volatile uint32_t tx_fifo_rptr_i = 0; // read pointer for I
 static volatile uint32_t tx_fifo_rptr_q =
@@ -294,7 +320,7 @@ static bool __not_in_flash_func(has_data_to_send)() {
     if (is_filler)
       return true;
     uint16_t length_to_crc = FRAME_CODED_BYTES;
-    uint16_t rs_parity_size = use_rs ? 128 : 0;
+    uint16_t rs_parity_size = use_rs ? FRAME_PARITY_BYTES : 0;
     uint16_t payload_size =
         length_to_crc - rs_parity_size - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
     uint32_t bytes_needed = current_sp_size - current_sp_offset;
@@ -321,7 +347,7 @@ static bool __not_in_flash_func(has_data_to_send)() {
 
 static void __not_in_flash_func(generate_next_frame)(void) {
   uint32_t tf_bytes = FRAME_CODED_BYTES;
-  uint8_t local_frame[1024];
+  uint8_t local_frame[FULL_PACKET_SIZE];
 
   uint32_t t_bb = time_us_32();
   bool has_data = has_data_to_send();
@@ -333,7 +359,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
     tx_user_frames_generated++;
 
   uint16_t fhp = MPDU_NO_START_PACKET;
-  uint16_t parity_size = (use_rs || use_ldpc) ? 128 : 0;
+  uint16_t parity_size = (use_rs || use_ldpc) ? FRAME_PARITY_BYTES : 0;
   uint16_t payload_size =
       tf_bytes - parity_size - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
 
@@ -400,7 +426,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
   local_frame[VCDU_HEADER_SIZE + 1] = fhp & 0xFF;
 
   if (use_fecf) {
-    uint16_t length_to_crc = 892 - 2;
+    uint16_t length_to_crc = FRAME_PAYLOAD_LIMIT - 2;
     uint16_t crc = 0xFFFF;
     for (uint16_t i = 0; i < length_to_crc; i++) {
       crc ^= (local_frame[i] << 8);
@@ -415,17 +441,17 @@ static void __not_in_flash_func(generate_next_frame)(void) {
     local_frame[length_to_crc + 1] = crc & 0xFF;
   }
 
-  // Apply FEC encoding if enabled (overwrites the last 128 bytes with parity)
+  // Apply FEC encoding if enabled (overwrites the last FRAME_PARITY_BYTES bytes with parity)
   if (use_ldpc) {
     uint8_t temp[1020];
-    ldpc_78_encode(local_frame, 892, temp);
+    ldpc_78_encode(local_frame, FRAME_PAYLOAD_LIMIT, temp);
     memcpy(local_frame, temp, 1020);
   } else if (use_rs) {
-    rs_encode_interleaved(&local_frame[0], &local_frame[892], 4);
+    rs_encode_interleaved(&local_frame[0], &local_frame[FRAME_PAYLOAD_LIMIT], 4);
   }
 
   // Combine ASM and randomized payload into a single 1024-byte packet
-  uint8_t full_packet[1024];
+  uint8_t full_packet[FULL_PACKET_SIZE];
 
   // ASM is 4 bytes, unrandomized
   full_packet[0] = 0x1A;
@@ -449,7 +475,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
   if (use_conv) {
     uint32_t local_wptr = tx_fifo_wptr;
     // Process the entire 1024-byte packet continuously
-    for (int i = 0; i < 1024; i++) {
+    for (int i = 0; i < FULL_PACKET_SIZE; i++) {
       uint8_t raw_byte = full_packet[i];
       if (use_nrzm) {
         raw_byte = encode_nrzm_byte(raw_byte);
@@ -467,7 +493,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
 
       if (puncturing_rate == 0) {
         for (int bit = 15; bit >= 0; bit--) {
-          tx_bit_fifo[local_wptr & 131071] = (out_16 >> bit) & 1;
+          tx_bit_fifo[local_wptr & TX_FIFO_MASK] = (out_16 >> bit) & 1;
           local_wptr++;
         }
       } else {
@@ -478,7 +504,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
         uint8_t count_hi = (p_hi >> 8) & 0xFF;
         uint8_t bits_hi = p_hi & 0xFF;
         for (int bit = count_hi - 1; bit >= 0; bit--) {
-          tx_bit_fifo[local_wptr & 131071] = (bits_hi >> bit) & 1;
+          tx_bit_fifo[local_wptr & TX_FIFO_MASK] = (bits_hi >> bit) & 1;
           local_wptr++;
         }
 
@@ -489,7 +515,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
         uint8_t count_lo = (p_lo >> 8) & 0xFF;
         uint8_t bits_lo = p_lo & 0xFF;
         for (int bit = count_lo - 1; bit >= 0; bit--) {
-          tx_bit_fifo[local_wptr & 131071] = (bits_lo >> bit) & 1;
+          tx_bit_fifo[local_wptr & TX_FIFO_MASK] = (bits_lo >> bit) & 1;
           local_wptr++;
         }
       }
@@ -498,13 +524,13 @@ static void __not_in_flash_func(generate_next_frame)(void) {
   } else {
     uint32_t local_wptr = tx_fifo_wptr;
     // Uncoded branch
-    for (int i = 0; i < 1024; i++) {
+    for (int i = 0; i < FULL_PACKET_SIZE; i++) {
       uint8_t raw_byte = full_packet[i];
       if (use_nrzm) {
         raw_byte = encode_nrzm_byte(raw_byte);
       }
       for (int bit = 7; bit >= 0; bit--) {
-        tx_bit_fifo[local_wptr & 131071] = (raw_byte >> bit) & 1;
+        tx_bit_fifo[local_wptr & TX_FIFO_MASK] = (raw_byte >> bit) & 1;
         local_wptr++;
       }
     }
@@ -532,43 +558,120 @@ static int32_t q_timer =
 // Bit layout: [1:0]={Q[0],I[0]}, [3:2]={Q[1],I[1]}, ...
 // ============================================================
 
-__attribute__((optimize("O3"))) static uint32_t
-__not_in_flash_func(build_iq_word)(void) {
+// ============================================================
+// 2nd-order Sigma-Delta modulator state — file-scope so every
+// mode-specialized variant shares continuous state.
+// ============================================================
+static int32_t sd_i_acc1 = 0;
+static int32_t sd_i_acc2 = 0;
+static int32_t sd_q_acc1 = 0;
+static int32_t sd_q_acc2 = 0;
+static int32_t fb_i = 0;
+static int32_t fb_q = 0;
+// 16-bit LFSR dither state — breaks SD limit cycles by injecting ±1 noise
+static uint16_t sd_dither = 0xACE1;
+static constexpr int32_t SD_FB = 30000;
+static constexpr int32_t SD_CLAMP = SD_FB * 3;
+
+// Common prologue: load SD state and cache calibration values in registers
+#define SD_STATE_LOAD \
+  int32_t acc1_i = sd_i_acc1; \
+  int32_t acc2_i = sd_i_acc2; \
+  int32_t acc1_q = sd_q_acc1; \
+  int32_t acc2_q = sd_q_acc2; \
+  int32_t local_fb_i = fb_i; \
+  int32_t local_fb_q = fb_q; \
+  const int32_t _gain_cal = q_gain_cal; \
+  const int32_t _ph_cal = phase_cal; \
+  const int32_t _i_dc = i_dc_offset; \
+  const int32_t _q_dc = q_dc_offset; \
+  /* LFSR dither: inject ±1 into first integrator to break limit cycles */ \
+  sd_dither = (sd_dither >> 1) ^ (-(sd_dither & 1) & 0xB400u); \
+  acc1_i += (int32_t)((sd_dither & 1) << 1) - 1; \
+  acc1_q += (int32_t)((sd_dither & 2)) - 1;
+
+// Common epilogue: anti-windup clamp + write back
+#define SD_STATE_SAVE \
+  if (acc1_i > SD_CLAMP) acc1_i = SD_CLAMP; \
+  else if (acc1_i < -SD_CLAMP) acc1_i = -SD_CLAMP; \
+  if (acc2_i > SD_CLAMP) acc2_i = SD_CLAMP; \
+  else if (acc2_i < -SD_CLAMP) acc2_i = -SD_CLAMP; \
+  if (acc1_q > SD_CLAMP) acc1_q = SD_CLAMP; \
+  else if (acc1_q < -SD_CLAMP) acc1_q = -SD_CLAMP; \
+  if (acc2_q > SD_CLAMP) acc2_q = SD_CLAMP; \
+  else if (acc2_q < -SD_CLAMP) acc2_q = -SD_CLAMP; \
+  sd_i_acc1 = acc1_i; \
+  sd_i_acc2 = acc2_i; \
+  sd_q_acc1 = acc1_q; \
+  sd_q_acc2 = acc2_q; \
+  fb_i = local_fb_i; \
+  fb_q = local_fb_q;
+
+// SWAP_PINS / SWAP_IQ must be compile-time constants (0/1) so the
+// mode-specialized variants fully optimize.
+#define SD_LOOP_CORE(SWAP_PINS, SWAP_IQ) \
+  for (int pair = 0; pair < 16; pair++) { \
+    if (__builtin_expect(i_timer == 0, 0)) { \
+      tx_fifo_rptr_i += 2; \
+      i_pattern = ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & TX_FIFO_MASK]) & 31; \
+      i_timer = cycles_per_symbol; \
+      if (!SWAP_IQ) { \
+          base_i = rrc_table_i[i_pattern]; \
+          base_q_cross = rrc_table_q_cross[i_pattern]; \
+      } else { \
+          base_q_main = rrc_table_q_main[i_pattern]; \
+      } \
+    } \
+    i_timer--; \
+    if (__builtin_expect(q_timer == 0, 0)) { \
+      tx_fifo_rptr_q += 2; \
+      q_pattern = ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK]) & 31; \
+      q_timer = cycles_per_symbol; \
+      if (!SWAP_IQ) { \
+          base_q_main = rrc_table_q_main[q_pattern]; \
+      } else { \
+          base_i = rrc_table_i[q_pattern]; \
+          base_q_cross = rrc_table_q_cross[q_pattern]; \
+      } \
+    } \
+    q_timer--; \
+    int i_sample_idx = (cycles_per_symbol - 1) - i_timer; \
+    int q_sample_idx = (cycles_per_symbol - 1) - q_timer; \
+    int32_t val_i_cal = base_i[i_sample_idx]; \
+    int16_t val_q_main = base_q_main[q_sample_idx]; \
+    int16_t val_q_cross = base_q_cross[i_sample_idx]; \
+    int32_t val_q_cal = (int32_t)val_q_main + val_q_cross; \
+    acc1_i += val_i_cal - local_fb_i; \
+    acc2_i += acc1_i - local_fb_i; \
+    uint32_t sign_i = ((uint32_t)acc2_i) >> 31; \
+    local_fb_i = sign_i ? -SD_FB : SD_FB; \
+    acc1_q += val_q_cal - local_fb_q; \
+    acc2_q += acc1_q - local_fb_q; \
+    uint32_t sign_q = ((uint32_t)acc2_q) >> 31; \
+    local_fb_q = sign_q ? -SD_FB : SD_FB; \
+    uint32_t out_i = sign_i ^ 1; \
+    uint32_t out_q = sign_q ^ 1; \
+    word >>= 2; \
+    if (SWAP_PINS) { \
+        word |= (out_q | (out_i << 1)) << 30; \
+    } else { \
+        word |= (out_i | (out_q << 1)) << 30; \
+    } \
+  }
+
+// Boot-only branchy implementation (used by setup() priming). The compiler
+// decides inlining; kept in flash since it never runs on the hot path.
+static inline uint32_t build_iq_word_impl(void) {
   // Wait for Core 0 to prime the patterns (on boot and after reset)
   if (needs_pattern_init) {
     return 0; // Output 0s while Core 0 fills the FIFO
   }
 
-  // 2nd-order Sigma-Delta state variables (cached in registers during loop)
-  static int32_t sd_i_acc1 = 0;
-  static int32_t sd_i_acc2 = 0;
-  static int32_t sd_q_acc1 = 0;
-  static int32_t sd_q_acc2 = 0;
-  static int32_t fb_i = 0;
-  static int32_t fb_q = 0;
-
-  int32_t acc1_i = sd_i_acc1;
-  int32_t acc2_i = sd_i_acc2;
-  int32_t acc1_q = sd_q_acc1;
-  int32_t acc2_q = sd_q_acc2;
-  int32_t local_fb_i = fb_i;
-  int32_t local_fb_q = fb_q;
-
-  int32_t gain_cal = q_gain_cal;
-  int32_t ph_cal = phase_cal;
-  int32_t i_dc = i_dc_offset;
-  int32_t q_dc = q_dc_offset;
-
-  static constexpr int32_t SD_FB = 30000;
-  static constexpr int32_t SD_CLAMP = SD_FB * 3;
+  SD_STATE_LOAD;
 
   uint32_t word = 0;
   const bool _swap_iq = swap_iq;
   const bool _swap_pins = swap_pins;
-  const int32_t _gain_cal = gain_cal;
-  const int32_t _ph_cal = ph_cal;
-  const int32_t _i_dc = i_dc;
-  const int32_t _q_dc = q_dc;
 
   if (cw_mode) {
     int32_t vi = (int32_t)digital_scale + _i_dc;
@@ -596,7 +699,7 @@ __not_in_flash_func(build_iq_word)(void) {
       if (i_timer == 0) {
         tx_fifo_rptr_i += 2;
         i_pattern =
-            ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & 131071]) &
+            ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & TX_FIFO_MASK]) &
             31;
         i_timer = cycles_per_symbol;
       }
@@ -604,7 +707,7 @@ __not_in_flash_func(build_iq_word)(void) {
       if (q_timer == 0) {
         tx_fifo_rptr_q += 2;
         q_pattern =
-            ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & 131071]) &
+            ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK]) &
             31;
         q_timer = cycles_per_symbol;
       }
@@ -638,107 +741,67 @@ __not_in_flash_func(build_iq_word)(void) {
       word |= (uint32_t)(out_i | (out_q << 1)) << 30;
     }
   } else {
+    // Use the file-scope SD_LOOP_CORE macro (SWAP_PINS, SWAP_IQ are
+    // compile-time constants in variant functions, but here they are
+    // runtime booleans — the macro still works, just with branches).
     const int16_t* base_i = rrc_table_i[_swap_iq ? q_pattern : i_pattern];
     const int16_t* base_q_main = rrc_table_q_main[_swap_iq ? i_pattern : q_pattern];
     const int16_t* base_q_cross = rrc_table_q_cross[_swap_iq ? q_pattern : i_pattern];
 
-#define SD_LOOP_CORE(SWAP_PINS, SWAP_IQ) \
-    for (int pair = 0; pair < 16; pair++) { \
-      if (__builtin_expect(i_timer == 0, 0)) { \
-        tx_fifo_rptr_i += 2; \
-        i_pattern = ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & 131071]) & 31; \
-        i_timer = cycles_per_symbol; \
-        if (!SWAP_IQ) { \
-            base_i = rrc_table_i[i_pattern]; \
-            base_q_cross = rrc_table_q_cross[i_pattern]; \
-        } else { \
-            base_q_main = rrc_table_q_main[i_pattern]; \
-        } \
-      } \
-      i_timer--; \
-      if (__builtin_expect(q_timer == 0, 0)) { \
-        tx_fifo_rptr_q += 2; \
-        q_pattern = ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & 131071]) & 31; \
-        q_timer = cycles_per_symbol; \
-        if (!SWAP_IQ) { \
-            base_q_main = rrc_table_q_main[q_pattern]; \
-        } else { \
-            base_i = rrc_table_i[q_pattern]; \
-            base_q_cross = rrc_table_q_cross[q_pattern]; \
-        } \
-      } \
-      q_timer--; \
-      int i_sample_idx = (cycles_per_symbol - 1) - i_timer; \
-      int q_sample_idx = (cycles_per_symbol - 1) - q_timer; \
-      int32_t val_i_cal = base_i[i_sample_idx]; \
-      int16_t val_q_main = base_q_main[q_sample_idx]; \
-      int16_t val_q_cross = base_q_cross[i_sample_idx]; \
-      int32_t val_q_cal = (int32_t)val_q_main + val_q_cross; \
-      acc1_i += val_i_cal - local_fb_i; \
-      acc2_i += acc1_i - local_fb_i; \
-      uint32_t sign_i = ((uint32_t)acc2_i) >> 31; \
-      local_fb_i = sign_i ? -SD_FB : SD_FB; \
-      acc1_q += val_q_cal - local_fb_q; \
-      acc2_q += acc1_q - local_fb_q; \
-      uint32_t sign_q = ((uint32_t)acc2_q) >> 31; \
-      local_fb_q = sign_q ? -SD_FB : SD_FB; \
-      uint32_t out_i = sign_i ^ 1; \
-      uint32_t out_q = sign_q ^ 1; \
-      word >>= 2; \
-      if (SWAP_PINS) { \
-          word |= (out_q | (out_i << 1)) << 30; \
-      } else { \
-          word |= (out_i | (out_q << 1)) << 30; \
-      } \
-    }
-
     if (_swap_pins) {
         if (_swap_iq) {
 #pragma GCC unroll 16
-            SD_LOOP_CORE(true, true)
+            SD_LOOP_CORE(1, 1)
         } else {
 #pragma GCC unroll 16
-            SD_LOOP_CORE(true, false)
+            SD_LOOP_CORE(1, 0)
         }
     } else {
         if (_swap_iq) {
 #pragma GCC unroll 16
-            SD_LOOP_CORE(false, true)
+            SD_LOOP_CORE(0, 1)
         } else {
 #pragma GCC unroll 16
-            SD_LOOP_CORE(false, false)
+            SD_LOOP_CORE(0, 0)
         }
     }
   }
 
-  // Save back to RAM (with anti-windup clamping applied once here for low CPU
-  // overhead)
-  if (acc1_i > SD_CLAMP)
-    acc1_i = SD_CLAMP;
-  else if (acc1_i < -SD_CLAMP)
-    acc1_i = -SD_CLAMP;
-  if (acc2_i > SD_CLAMP)
-    acc2_i = SD_CLAMP;
-  else if (acc2_i < -SD_CLAMP)
-    acc2_i = -SD_CLAMP;
-  if (acc1_q > SD_CLAMP)
-    acc1_q = SD_CLAMP;
-  else if (acc1_q < -SD_CLAMP)
-    acc1_q = -SD_CLAMP;
-  if (acc2_q > SD_CLAMP)
-    acc2_q = SD_CLAMP;
-  else if (acc2_q < -SD_CLAMP)
-    acc2_q = -SD_CLAMP;
-
-  sd_i_acc1 = acc1_i;
-  sd_i_acc2 = acc2_i;
-  sd_q_acc1 = acc1_q;
-  sd_q_acc2 = acc2_q;
-  fb_i = local_fb_i;
-  fb_q = local_fb_q;
-
+  SD_STATE_SAVE;
   return word;
 }
+
+// ============================================================
+// Mode selection — active_mode is a plain enum (not volatile),
+// written by Core 0 and read by Core 1 (loop1) once per refill.
+// ============================================================
+
+enum iq_mode {
+  MODE_CW = 0,
+  MODE_BYPASS,
+  MODE_RRC_NORMAL,
+  MODE_RRC_SWAPIQ,
+  MODE_RRC_SWAPPINS,
+  MODE_RRC_SWAPBOTH,
+};
+static enum iq_mode active_mode = MODE_RRC_NORMAL;
+static volatile bool active_mode_dirty = true;
+
+// Call this whenever cw_mode / use_rrc / swap_iq / swap_pins change
+static void update_active_builder(void) {
+  if (cw_mode)                     { active_mode = MODE_CW; goto dirty; }
+  if (!use_rrc)                    { active_mode = MODE_BYPASS; goto dirty; }
+  if (swap_pins && swap_iq)        active_mode = MODE_RRC_SWAPBOTH;
+  else if (swap_pins)              active_mode = MODE_RRC_SWAPPINS;
+  else if (swap_iq)                active_mode = MODE_RRC_SWAPIQ;
+  else                             active_mode = MODE_RRC_NORMAL;
+dirty:
+  __dmb();
+  active_mode_dirty = true;
+}
+
+// Cold (boot/init) wrapper — not force-inlined, kept in flash
+static uint32_t build_iq_word_cold(void) { return build_iq_word_impl(); }
 
 // Helper function to calculate Root Raised Cosine (RRC) filter coefficients.
 static float get_rrc_coef(float t, float T, float alpha) {
@@ -797,23 +860,38 @@ static void init_rrc_table(void) {
 // Setup
 // ============================================================
 
+// Select SX1255 analog filter bandwidth, PLL bandwidth, and DAC FIR taps
+// based on the current symbol rate and RRC alpha.
 void update_sx1255_dynamic_filters() {
-  // 1. Dynamic Analog Filter (DSB BW)
-  // Force the widest analog filter (filter_bw_val = 15) which is ~659 kHz.
-  // This pushes the analog low-pass cutoff far away from our 150 ksps baseband,
-  // drastically reducing group delay / phase distortion on the constellation.
-  filter_bw_val = 15;
-  sx.setTxFilterBandwidth(TXFE3_PLL_BW_75kHz, filter_bw_val);
+  // 1. PLL Bandwidth — must exceed the modulation bandwidth.
+  if (symbol_rate_hz > 400000)       current_pll_bw = TXFE3_PLL_BW_300kHz;
+  else if (symbol_rate_hz > 250000)  current_pll_bw = TXFE3_PLL_BW_225kHz;
+  else if (symbol_rate_hz > 100000)  current_pll_bw = TXFE3_PLL_BW_150kHz;
+  else                               current_pll_bw = TXFE3_PLL_BW_75kHz;
 
-  // 2. Dynamic DAC Digital Interpolator Filter
-  // Force the widest DAC interpolation filter (24 taps = highest cutoff).
+  // 2. Analog DSB Filter BW — set to ~1.5× the signal DSB bandwidth to pass
+  // the modulated signal cleanly while rejecting out-of-band sigma-delta noise.
+  // Formula: BW_DSB = 17.15/(41 - val) MHz → val = 41 - 17.15/BW_DSB_MHz.
+  // Signal DSB BW ≈ symbol_rate × (1+rrc_alpha).
+  float signal_bw_dsb_mhz = (float)symbol_rate_hz * (1.0f + rrc_alpha) / 1e6f;
+  float target_bw_mhz = signal_bw_dsb_mhz * 1.5f;
+  int bw_val = 31;
+  if (target_bw_mhz < 1.715f) {
+    bw_val = (int)(41.0f - 17.15f / target_bw_mhz);
+    if (bw_val < 0)  bw_val = 0;
+    if (bw_val > 31) bw_val = 31;
+  }
+  filter_bw_val = (uint8_t)bw_val;
+  sx.setTxFilterBandwidth(current_pll_bw, filter_bw_val);
+
+  // 3. DAC FIR-DAC reconstruction — always 24 taps (widest BW).
   sx.setTxDacBandwidth(TXFE4_DAC_BW_24TAPS);
 }
 
 void setup() {
   vreg_set_voltage(VREG_VOLTAGE_1_30);
-  delay(10); // Let voltage settle
-  set_sys_clock_khz(400000, false);
+  delay(100); // Let voltage settle
+  set_sys_clock_khz(380000, true);
   rs_init();
 
   Serial.begin(921600);
@@ -835,18 +913,10 @@ void setup() {
     EEPROM.get(30, filter_bw_val);
     if (symbol_rate_hz == 0 || symbol_rate_hz == 0xFFFFFFFF)
       symbol_rate_hz = 100000;
-    if (filter_bw_val > 15)
+    if (filter_bw_val > 31)
       filter_bw_val = 0;
 
-    // Target CLKIN in the optimal RP2040 software limit (~8 Msps)
-    cycles_per_symbol = 7500000u / symbol_rate_hz;
-    if (cycles_per_symbol > 512)
-      cycles_per_symbol = 512; // Max RRC table size
-    cycles_per_symbol &= ~1u; // Ensure it's even for perfect OQPSK phase offset
-    if (cycles_per_symbol < 2)
-      cycles_per_symbol = 2;
-
-    clkin_hz = symbol_rate_hz * cycles_per_symbol;
+    apply_symbol_rate(symbol_rate_hz);
 
     if (mixer_gain > 15)
       mixer_gain = 14;
@@ -871,6 +941,8 @@ void setup() {
     digital_scale = 11000.0f;
     Serial.println("No calibration data in EEPROM (defaulting to 0/defaults)");
   }
+
+  apply_symbol_rate(symbol_rate_hz);
 
   init_rrc_table();
 
@@ -952,12 +1024,13 @@ void setup() {
 
   // --- Pre-fill DMA buffers and start DMA ---
   for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
-    dma_buf[0][i] = build_iq_word();
+    dma_buf[0][i] = build_iq_word_cold();
   }
   for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
-    dma_buf[1][i] = build_iq_word();
+    dma_buf[1][i] = build_iq_word_cold();
   }
   next_buf_to_fill = 0;
+  update_active_builder(); // Select correct mode-specialized variant
 
   dma_chan0 = dma_claim_unused_channel(true);
   dma_chan1 = dma_claim_unused_channel(true);
@@ -1004,15 +1077,8 @@ void setup() {
 static void process_input(char mode, const char *data) {
   if (mode == 'r') {
     uint32_t sr = strtoul(data, NULL, 10);
-    if (sr >= 1000 && sr <= 4000000) {
-      symbol_rate_hz = sr;
-      cycles_per_symbol = 7500000u / symbol_rate_hz;
-      if (cycles_per_symbol > 512)
-        cycles_per_symbol = 512;
-      cycles_per_symbol &= ~1u;
-      if (cycles_per_symbol < 2)
-        cycles_per_symbol = 2;
-      clkin_hz = symbol_rate_hz * cycles_per_symbol;
+    if (sr >= 1000 && sr <= 5000000) {
+      apply_symbol_rate(sr);
       pio_sm_set_clkdiv(pio, sm,
                         (float)clock_get_hz(clk_sys) / (float)(clkin_hz * 2u));
       init_rrc_table();
@@ -1020,7 +1086,7 @@ static void process_input(char mode, const char *data) {
       reset_request = true;
       Serial.printf("Symbol rate set to %lu Hz\n", symbol_rate_hz);
     } else {
-      Serial.println("Invalid symbol rate (must be 1000 - 4000000)");
+      Serial.println("Invalid symbol rate (must be 1000 - 5000000)");
     }
   } else if (mode == 's') {
     Serial.println("Modulation started (always on)");
@@ -1055,7 +1121,10 @@ static void process_input(char mode, const char *data) {
                   use_rs ? "ON" : "OFF");
   } else if (mode == 'L') {
     use_ldpc = !use_ldpc;
-    if (use_ldpc) use_rs = false;
+    if (use_ldpc) {
+      use_rs = false;
+      use_conv = false; // Add this to prevent double-encoding!
+    }
     Serial.printf("LDPC (8160,7136) encoding: %s\n",
                   use_ldpc ? "ON" : "OFF");
   } else if (mode == 'e') {
@@ -1084,6 +1153,7 @@ static void process_input(char mode, const char *data) {
     Serial.printf("G2 Inversion: %s\n", invert_g2 ? "ON" : "OFF");
   } else if (mode == 'S') {
     swap_iq = !swap_iq;
+    update_active_builder();
     Serial.printf("I/Q Data Swap: %s\n", swap_iq ? "ON" : "OFF");
   } else if (mode == 'A') {
     if (rrc_alpha > 0.4f) {
@@ -1094,6 +1164,7 @@ static void process_input(char mode, const char *data) {
       rrc_alpha = 0.5f;
     }
     init_rrc_table();
+    update_sx1255_dynamic_filters();
     Serial.printf("RRC Alpha set to: %.2f\n", (double)rrc_alpha);
   } else if (mode == 'F') {
     int min_dac = 0, span = 8, type = 1;
@@ -1105,6 +1176,7 @@ static void process_input(char mode, const char *data) {
         rrc_alpha = 0.5f; // fallback
       }
       init_rrc_table();
+      update_sx1255_dynamic_filters();
       Serial.printf("RRC Alpha set to: %.2f\n", (double)rrc_alpha);
     }
   } else if (mode == '+') {
@@ -1181,12 +1253,15 @@ static void process_input(char mode, const char *data) {
     Serial.printf("Q DC: %d\n", q_dc_offset);
   } else if (mode == 'z') {
     cw_mode = !cw_mode;
+    update_active_builder();
     Serial.printf("CW Mode: %s\n", cw_mode ? "ON" : "OFF");
   } else if (mode == 'W') {
     use_rrc = !use_rrc;
+    update_active_builder();
     Serial.printf("RRC Filter: %s\n", use_rrc ? "ON" : "BYPASSED");
-  } else if (mode == 'x') {
+  } else if (mode == 'X') {
     swap_pins = !swap_pins;
+    update_active_builder();
     Serial.printf("Pin Swap: %s\n", swap_pins ? "ON" : "OFF");
   } else if (mode == 'v') {
     if (digital_scale > 4000.0f) {
@@ -1203,12 +1278,12 @@ static void process_input(char mode, const char *data) {
   } else if (mode == 'b') {
     if (filter_bw_val > 0)
       filter_bw_val--;
-    sx.setTxFilterBandwidth(TXFE3_PLL_BW_75kHz, filter_bw_val);
+    sx.setTxFilterBandwidth(current_pll_bw, filter_bw_val);
     Serial.printf("DSB Filter BW: %d\n", filter_bw_val);
   } else if (mode == 'B') {
-    if (filter_bw_val < 15)
+    if (filter_bw_val < 31)
       filter_bw_val++;
-    sx.setTxFilterBandwidth(TXFE3_PLL_BW_75kHz, filter_bw_val);
+    sx.setTxFilterBandwidth(current_pll_bw, filter_bw_val);
     Serial.printf("DSB Filter BW: %d\n", filter_bw_val);
   } else if (mode == 'w') {
     save_calibration_to_eeprom();
@@ -1237,7 +1312,7 @@ static void process_input(char mode, const char *data) {
     Serial.printf("LDPC (8160,7136): %s\n", use_ldpc ? "ON" : "OFF");
     Serial.printf("FECF (CRC-16): %s\n", use_fecf ? "ON" : "OFF");
 
-    uint16_t parity_size = (use_rs || use_ldpc) ? 128 : 0;
+    uint16_t parity_size = (use_rs || use_ldpc) ? FRAME_PARITY_BYTES : 0;
     uint16_t expected_payload = FRAME_CODED_BYTES - parity_size -
                                 VCDU_HEADER_SIZE - MPDU_HEADER_SIZE - (use_fecf ? 2 : 0);
     Serial.printf("Expected Payload: %u bytes\n", expected_payload);
@@ -1376,7 +1451,10 @@ void setup1() {
   // Initialization done on Core 0
 }
 
-void loop1() {
+// NOTE: Must be RAM-resident on RP2350. The 6 inlined loop bodies (each
+// DMA_BUF_SIZE × 16 unrolled) exceed the instruction cache, so flash
+// execution causes I-cache thrashing and catastrophic headroom loss.
+void __not_in_flash_func(loop1)() {
   if (!dma_ready) {
     delay(1);
     return;
@@ -1410,26 +1488,163 @@ void loop1() {
     }
     // Prime 5-symbol shift-register patterns from live FIFO data
     i_pattern = 0;
-    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i - 4) & 131071] << 4;
-    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i - 2) & 131071] << 3;
-    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i) & 131071] << 2;
-    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i + 2) & 131071] << 1;
-    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i + 4) & 131071];
+    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i - 4) & TX_FIFO_MASK] << 4;
+    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i - 2) & TX_FIFO_MASK] << 3;
+    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i) & TX_FIFO_MASK] << 2;
+    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i + 2) & TX_FIFO_MASK] << 1;
+    i_pattern |= tx_bit_fifo[(tx_fifo_rptr_i + 4) & TX_FIFO_MASK];
     q_pattern = 0;
-    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q - 4) & 131071] << 4;
-    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q - 2) & 131071] << 3;
-    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q) & 131071] << 2;
-    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q + 2) & 131071] << 1;
-    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q + 4) & 131071];
+    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q - 4) & TX_FIFO_MASK] << 4;
+    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q - 2) & TX_FIFO_MASK] << 3;
+    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q) & TX_FIFO_MASK] << 2;
+    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q + 2) & TX_FIFO_MASK] << 1;
+    q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK];
     needs_pattern_init = false;
   }
 
   int active_chan = (next_buf_to_fill == 0) ? dma_chan0 : dma_chan1;
   if (!dma_channel_is_busy(active_chan)) {
+    int other_chan = (next_buf_to_fill == 0) ? dma_chan1 : dma_chan0;
+    if (!dma_channel_is_busy(other_chan)) {
+      tx_dma_underflows++;
+    }
     uint32_t t_start = micros();
-    // Refill this buffer
-    for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
-      dma_buf[next_buf_to_fill][i] = build_iq_word();
+    // Memory barrier: active_mode is written by Core 0, read here.
+    // Skip the barrier when the mode hasn't changed (the common case).
+    if (active_mode_dirty) {
+      __dmb();
+      active_mode_dirty = false;
+    }
+    // Refill this buffer — switch on mode once per buffer, not per word
+    switch (active_mode) {
+      case MODE_CW: {
+        SD_STATE_LOAD;
+        int32_t vi = (int32_t)digital_scale + _i_dc;
+        int32_t vq = (int32_t)digital_scale +
+                     (((int32_t)digital_scale * _gain_cal) >> 10) -
+                     (((int32_t)digital_scale * _ph_cal) >> 10) + _q_dc;
+        const bool _swap_pins = swap_pins;
+        for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
+          uint32_t word = 0;
+#pragma GCC unroll 16
+          for (int pair = 0; pair < 16; pair++) {
+            acc1_i += vi - local_fb_i;
+            acc2_i += acc1_i - local_fb_i;
+            local_fb_i = (acc2_i < 0) ? -SD_FB : SD_FB;
+            acc1_q += vq - local_fb_q;
+            acc2_q += acc1_q - local_fb_q;
+            local_fb_q = (acc2_q < 0) ? -SD_FB : SD_FB;
+            uint8_t out_i = _swap_pins ? (local_fb_q > 0) : (local_fb_i > 0);
+            uint8_t out_q = _swap_pins ? (local_fb_i > 0) : (local_fb_q > 0);
+            word >>= 2;
+            word |= (uint32_t)(out_i | (out_q << 1)) << 30;
+          }
+          dma_buf[next_buf_to_fill][i] = word;
+        }
+        SD_STATE_SAVE;
+        break;
+      }
+      case MODE_BYPASS: {
+        SD_STATE_LOAD;
+        const bool _swap_iq = swap_iq;
+        const bool _swap_pins = swap_pins;
+        for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
+          uint32_t word = 0;
+#pragma GCC unroll 16
+          for (int pair = 0; pair < 16; pair++) {
+            if (i_timer == 0) {
+              tx_fifo_rptr_i += 2;
+              i_pattern = ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & TX_FIFO_MASK]) & 31;
+              i_timer = cycles_per_symbol;
+            }
+            i_timer--;
+            if (q_timer == 0) {
+              tx_fifo_rptr_q += 2;
+              q_pattern = ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK]) & 31;
+              q_timer = cycles_per_symbol;
+            }
+            q_timer--;
+            int symbol_i = (i_pattern >> 2) & 1;
+            int symbol_q = (q_pattern >> 2) & 1;
+            int symbol_actual_i = _swap_iq ? symbol_q : symbol_i;
+            int symbol_actual_q = _swap_iq ? symbol_i : symbol_q;
+            int32_t val_i = symbol_actual_i ? (int32_t)digital_scale : -(int32_t)digital_scale;
+            int32_t val_q = symbol_actual_q ? (int32_t)digital_scale : -(int32_t)digital_scale;
+            int32_t val_i_cal = val_i + _i_dc;
+            int32_t val_q_cal = val_q + ((val_q * _gain_cal) >> 10) - ((val_i * _ph_cal) >> 10) + _q_dc;
+            acc1_i += val_i_cal - local_fb_i;
+            acc2_i += acc1_i - local_fb_i;
+            local_fb_i = (acc2_i < 0) ? -SD_FB : SD_FB;
+            acc1_q += val_q_cal - local_fb_q;
+            acc2_q += acc1_q - local_fb_q;
+            local_fb_q = (acc2_q < 0) ? -SD_FB : SD_FB;
+            uint8_t out_i = _swap_pins ? (local_fb_q > 0) : (local_fb_i > 0);
+            uint8_t out_q = _swap_pins ? (local_fb_i > 0) : (local_fb_q > 0);
+            word >>= 2;
+            word |= (uint32_t)(out_i | (out_q << 1)) << 30;
+          }
+          dma_buf[next_buf_to_fill][i] = word;
+        }
+        SD_STATE_SAVE;
+        break;
+      }
+      // Intentionally hand-duplicated for maximum performance
+      case MODE_RRC_NORMAL: {
+        SD_STATE_LOAD;
+        for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
+          uint32_t word = 0;
+          const int16_t* base_i = rrc_table_i[i_pattern];
+          const int16_t* base_q_main = rrc_table_q_main[q_pattern];
+          const int16_t* base_q_cross = rrc_table_q_cross[i_pattern];
+#pragma GCC unroll 16
+          SD_LOOP_CORE(0, 0);
+          dma_buf[next_buf_to_fill][i] = word;
+        }
+        SD_STATE_SAVE;
+        break;
+      }
+      case MODE_RRC_SWAPIQ: {
+        SD_STATE_LOAD;
+        for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
+          uint32_t word = 0;
+          const int16_t* base_i = rrc_table_i[q_pattern];
+          const int16_t* base_q_main = rrc_table_q_main[i_pattern];
+          const int16_t* base_q_cross = rrc_table_q_cross[q_pattern];
+#pragma GCC unroll 16
+          SD_LOOP_CORE(0, 1);
+          dma_buf[next_buf_to_fill][i] = word;
+        }
+        SD_STATE_SAVE;
+        break;
+      }
+      case MODE_RRC_SWAPPINS: {
+        SD_STATE_LOAD;
+        for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
+          uint32_t word = 0;
+          const int16_t* base_i = rrc_table_i[i_pattern];
+          const int16_t* base_q_main = rrc_table_q_main[q_pattern];
+          const int16_t* base_q_cross = rrc_table_q_cross[i_pattern];
+#pragma GCC unroll 16
+          SD_LOOP_CORE(1, 0);
+          dma_buf[next_buf_to_fill][i] = word;
+        }
+        SD_STATE_SAVE;
+        break;
+      }
+      case MODE_RRC_SWAPBOTH: {
+        SD_STATE_LOAD;
+        for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
+          uint32_t word = 0;
+          const int16_t* base_i = rrc_table_i[q_pattern];
+          const int16_t* base_q_main = rrc_table_q_main[i_pattern];
+          const int16_t* base_q_cross = rrc_table_q_cross[q_pattern];
+#pragma GCC unroll 16
+          SD_LOOP_CORE(1, 1);
+          dma_buf[next_buf_to_fill][i] = word;
+        }
+        SD_STATE_SAVE;
+        break;
+      }
     }
     last_refill_duration_us = micros() - t_start;
 

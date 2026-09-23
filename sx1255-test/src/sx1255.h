@@ -14,6 +14,7 @@
 
 // TXFE4 DAC BW constants
 #define TXFE4_DAC_BW_24TAPS 0x00
+#define TXFE4_DAC_BW_32TAPS 0x01
 #define TXFE4_DAC_BW_40TAPS 0x02
 #define TXFE4_DAC_BW_64TAPS 0x05
 

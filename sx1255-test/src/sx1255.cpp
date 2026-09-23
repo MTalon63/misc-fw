@@ -104,7 +104,7 @@ void SX1255::setIismModeA() {
 }
 
 void SX1255::setClockSelectTxDac() {
-  writeReg(REG_CK_SEL, CK_SEL_CLK_SEL_TX_DAC);
+  writeReg(REG_CK_SEL, 0x00); // Select internal 32 MHz XOSC for DAC clock
 }
 
 void SX1255::enableTx() {

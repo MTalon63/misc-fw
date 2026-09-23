@@ -317,20 +317,27 @@ def serial_worker(args):
                 frame_size = int(frame_size_str.split()[0])
 
                 conv_status = status.get("Convolutional", "OFF")
-                symbols_per_frame = float(frame_size * 8)
-                if "ON" in conv_status:
-                    if "1/2" in conv_status:
-                        symbols_per_frame = frame_size * 16.0
-                    elif "2/3" in conv_status:
-                        symbols_per_frame = frame_size * 8 * 3 / 2
-                    elif "3/4" in conv_status:
-                        symbols_per_frame = frame_size * 8 * 4 / 3
-                    elif "5/6" in conv_status:
-                        symbols_per_frame = frame_size * 8 * 6 / 5
-                    elif "7/8" in conv_status:
-                        symbols_per_frame = frame_size * 8 * 8 / 7
+                
+                # Frame Size (1024 bytes) already includes RS/LDPC parity and the Attached Sync Marker.
+                base_bits_per_frame = float(frame_size * 8)
+                symbols_per_frame = base_bits_per_frame
 
-                # Account for QPSK (2 bits per symbol)
+                # Account for Convolutional code expansion
+                if "ON" in conv_status:
+                    # Check status string first, fall back to args.crate if rate isn't in the string
+                    crate_val = args.crate if args.crate is not None else 0
+                    if "2/3" in conv_status or (crate_val == 1 and conv_status == "ON"):
+                        symbols_per_frame = base_bits_per_frame * (3.0 / 2.0)
+                    elif "3/4" in conv_status or (crate_val == 2 and conv_status == "ON"):
+                        symbols_per_frame = base_bits_per_frame * (4.0 / 3.0)
+                    elif "5/6" in conv_status or (crate_val == 3 and conv_status == "ON"):
+                        symbols_per_frame = base_bits_per_frame * (6.0 / 5.0)
+                    elif "7/8" in conv_status or (crate_val == 4 and conv_status == "ON"):
+                        symbols_per_frame = base_bits_per_frame * (8.0 / 7.0)
+                    else:
+                        symbols_per_frame = base_bits_per_frame * 2.0
+
+                # Account for OQPSK modulation (2 bits per symbol)
                 symbols_per_frame /= 2.0
 
                 frames_per_sec = symbol_rate / symbols_per_frame
@@ -341,7 +348,7 @@ def serial_worker(args):
                 usable_bytes_per_sec = frames_per_sec * DUMMY_PAYLOAD_SIZE
                 usable_kbps = (usable_bytes_per_sec * 8) / 1000
                 
-                TARGET_FIFO_LEVEL = int(usable_bytes_per_sec * 0.5)
+                TARGET_FIFO_LEVEL = int(usable_bytes_per_sec * 2)
 
                 print(
                     f"[Serial]   Usable Bandwidth: {usable_kbps:.2f} kbps ({usable_bytes_per_sec/1024:.2f} KB/s)"
