@@ -1,7 +1,7 @@
 #include "ldpc.h"
 #include <string.h>
 
-static uint32_t G_CIRCULANTS[28][16] = {
+static const uint32_t G_CIRCULANTS[28][16] = {
     {0x19B57ED5, 0xBFDE0A55, 0x9898ABFB, 0xEBC3907F, 0x8477304D, 0x9052388C, 0x15257358, 0x023CE4B2, 0xFB1DA58B, 0xEA20FA59, 0x9B4DEB6B, 0x6497B728, 0x51ECBAAA, 0xAA2825AE, 0x316EB09C, 0x1CD7613C},
     {0xF7C52AF4, 0xD57AD734, 0x0F48BAF9, 0xAF1DE21B, 0x3401856E, 0x3DFBB18F, 0xD1F1C855, 0xE37E9FAC, 0xF538B461, 0xDBC64197, 0x37F441C9, 0xFDBB23FD, 0xDBBBF386, 0xA0CF1541, 0xCE747EC1, 0x75A2F2DA},
     {0x7863D95C, 0x036CFC45, 0x47A090CD, 0x63E3AACD, 0x88D66B3A, 0x0607C3FA, 0x10CF2F67, 0x3E30C863, 0x31B08617, 0xFAAF07BC, 0x6D76F3CC, 0x2434357C, 0x24315209, 0x4BE73D15, 0x5575C767, 0x43954226},
@@ -36,7 +36,7 @@ __attribute__((always_inline)) __attribute__((section(".time_critical.shift_left
 #if defined(__ARM_ARCH_8M_MAIN__)
     uint32_t *p = word;
     __asm__ volatile("ldr r1, [%[ptr], #60] \n\t" // Load word[15]
-                     "lsrs r1, r1, #31 \n\t"      // Shift Right by 31. Carry Flag = bit 510!
+                     "lsrs r1, r1, #31 \n\t"      // LSR carry = bit (31-1) = bit 30 of word[15] = global bit 510
                      "ldmia %[ptr], {r1, r2, r3, r4, r5, r6, r8, r9} \n\t" // Load first 8 words (no r7)
                      "adcs r1, r1 \n\t"           // word[0] = (word[0] << 1) | Carry
                      "adcs r2, r2 \n\t"
@@ -95,14 +95,12 @@ __attribute__((always_inline)) static inline uint32_t reverse_bits_32(uint32_t x
 #endif
 }
 
-__attribute__((section(".time_critical.ldpc_78_encode"))) void ldpc_78_encode(const uint8_t *info_bytes, uint16_t info_len, uint8_t *codeword_out) {
-    // 1. Clear the codeword buffer
-    memset(codeword_out, 0, 1020);
-
-    // 2. Copy the byte-aligned information data into the codeword buffer.
-    // The (8160, 7136) info block is 7136 bits (892 bytes).
-    uint16_t safe_len = info_len > 892 ? 892 : info_len;
-    memcpy(codeword_out, info_bytes, safe_len);
+__attribute__((section(".time_critical.ldpc_78_encode"))) void ldpc_78_encode(uint8_t *buf, uint16_t info_len) {
+    // In-place encode. buf already contains the info bytes at its start.
+    // The (8160, 7136) info block is 7136 bits (892 bytes). The info region
+    // (offset 0..891) and the parity region (offset 892..1019) do not
+    // overlap, so parity is computed from the info region and written in place.
+    (void)info_len;
 
     uint32_t parity0[16] = {0};
     uint32_t parity1[16] = {0};
@@ -110,7 +108,7 @@ __attribute__((section(".time_critical.ldpc_78_encode"))) void ldpc_78_encode(co
     int word_idx = 0;
     uint32_t current_word;
     // Safely load 4 bytes into a 32-bit integer regardless of pointer alignment or strict aliasing rules
-    memcpy(&current_word, &codeword_out[0], sizeof(uint32_t));
+    memcpy(&current_word, &buf[0], sizeof(uint32_t));
     current_word = __builtin_bswap32(current_word);
     uint32_t bit_mask = 0x80000000;
 
@@ -136,7 +134,7 @@ __attribute__((section(".time_critical.ldpc_78_encode"))) void ldpc_78_encode(co
             if (!bit_mask) {
                 bit_mask = 0x80000000;
                 word_idx++;
-                memcpy(&current_word, &codeword_out[word_idx * 4], sizeof(uint32_t));
+                memcpy(&current_word, &buf[word_idx * 4], sizeof(uint32_t));
                 current_word = __builtin_bswap32(current_word);
             }
 
@@ -197,8 +195,10 @@ __attribute__((section(".time_critical.ldpc_78_encode"))) void ldpc_78_encode(co
     }
     unified_parity[31] = (parity1[15] >> 1) & 0x3FFFFFFF; // Clear bits 30 & 31 of final word (trailing 2 zero bits)
 
-    // Write the packed parity words directly to codeword_out using hardware bit reversal and byte reversing stores
-    uint32_t *dst = (uint32_t *)(codeword_out + 892);
+    // Write the packed parity words directly into the parity region of buf
+    // using hardware bit reversal and byte reversing stores. The parity region
+    // (offset 892..1019) never overlaps the info region, so info is preserved.
+    uint32_t *dst = (uint32_t *)(buf + 892);
     for (int i = 0; i < 32; i++) {
         dst[i] = __builtin_bswap32(reverse_bits_32(unified_parity[i]));
     }

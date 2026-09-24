@@ -1,7 +1,8 @@
 @echo off
-echo Starting Modulator Service on COM8...
+set "PORT=COM13"
+echo Starting Modulator Service on %PORT%...
 
-python modulator_service.py COM13 ^
+python modulator_service.py %PORT% ^
     --rate 400000 ^
     --crate 1 ^
     --rs 1 ^

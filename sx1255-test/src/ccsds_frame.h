@@ -21,9 +21,9 @@ static constexpr uint8_t VCDU_TRANSFER_FRAME_VERSION =
 static constexpr uint16_t VCDU_SPACECRAFT_ID = 0x000; // All zeros (10 bits)
 static constexpr uint8_t VCDU_REPLAY_FLAG = 0;        // Always 0 (1 bit)
 static constexpr uint8_t VCDU_CYCLE_USE_FLAG = 1;     // Cycle use flag (1 bit)
-static constexpr uint8_t VCDU_FRAME_COUNT_CYCLE =
-    1;                                             // Frame count cycle (4 bits)
+// (removed: per-VC cycle now maintained in frame_counter_cycle[], see A-21)
 static constexpr uint8_t VCDU_DEFAULT_VCID = 0x00; // Default VCID = 0 (6 bits)
+static constexpr uint8_t VCDU_NUM_VC = 64;         // 6-bit VCID spans 64 VCs
 
 // CCSDS Multiplexing Protocol Data Unit (MPDU) Header - CCSDS 732.0-B-5
 static constexpr uint8_t MPDU_SEQ_CONTINUATION = 0x00;

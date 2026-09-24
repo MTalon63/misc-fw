@@ -14,6 +14,10 @@ HIGH_PRIORITY_QUEUE = queue.Queue()
 NORMAL_PRIORITY_QUEUE = queue.Queue()
 REAL_TIME_PRIORITY_QUEUE = queue.Queue()
 mcu_fifo_level = 0
+mcu_poly = None  # Current randomizer poly reported by the firmware ("poly toggled to X-bit")
+write_lock = threading.Lock()   # Serialises all ser.write() calls across threads
+status_queue = queue.Queue()    # Reader daemon delivers 'q' status responses here
+ready_event = threading.Event() # Set by the reader daemon on the "RDY" token
 seq_counters = defaultdict(int)
 
 # MCU FIFO is known to be 128 KB (131072 bytes)
@@ -25,15 +29,15 @@ DUMMY_PAYLOAD_SIZE = 8  # default CCSDS payload size
 
 
 def get_status(ser):
-    ser.read_all()
-    ser.write(b"q")
-    start_time = time.time()
-    response = b""
-    while time.time() - start_time < 2.0:
-        response += ser.read_all()
-        if b"Core 1 Headroom:" in response:
-            break
-        time.sleep(0.05)
+    # Only the reader daemon may read from 'ser'; it routes complete 'q' status
+    # responses to status_queue. This function just writes the request and waits.
+    with write_lock:
+        ser.write(b"q")
+        ser.flush()
+    try:
+        response = status_queue.get(timeout=2.0)
+    except queue.Empty:
+        response = b""
     status = {}
     lines = response.decode("utf-8", errors="ignore").split("\n")
     for line in lines:
@@ -50,9 +54,10 @@ def toggle_if_needed(ser, status, key, desired_state, toggle_cmd):
         is_on = current.startswith("ON")
         if (desired_state and not is_on) or (not desired_state and is_on):
             print(f"[Serial] Toggling {key} to {'ON' if desired_state else 'OFF'}...")
-            ser.write(toggle_cmd.encode("utf-8"))
+            with write_lock:
+                ser.write(toggle_cmd.encode("utf-8"))
+                ser.flush()
             time.sleep(0.1)
-            ser.read_all()
             return True
     return False
 
@@ -68,25 +73,27 @@ def toggle_poly_if_needed(ser, status, desired_poly):
                 pass
 
     if curr_poly is None:
-        ser.write(b"N")
+        # Firmware prints "Randomizer poly toggled to X-bit"; the reader daemon
+        # records that into mcu_poly, so we do not read directly from the port.
+        with write_lock:
+            ser.write(b"N")
+            ser.flush()
         time.sleep(0.1)
-        response = ser.read_all().decode("utf-8", errors="ignore")
-        if "polynomial: 8-bit" in response:
-            curr_poly = 8
-        elif "polynomial: 17-bit" in response:
-            curr_poly = 17
+        curr_poly = mcu_poly
 
         if curr_poly is not None and curr_poly != desired_poly:
-            ser.write(b"N")
+            with write_lock:
+                ser.write(b"N")
+                ser.flush()
             time.sleep(0.1)
-            ser.read_all()
         return True
     else:
         if curr_poly != desired_poly:
             print(f"[Serial] Toggling Randomizer Poly from {curr_poly}-bit to {desired_poly}-bit...")
-            ser.write(b"N")
+            with write_lock:
+                ser.write(b"N")
+                ser.flush()
             time.sleep(0.1)
-            ser.read_all()
             return True
     return False
 
@@ -137,7 +144,11 @@ def serial_worker(args):
     ser_instance = [None]
 
     def reader_daemon():
-        global mcu_fifo_level
+        global mcu_fifo_level, mcu_poly
+        # Sole thread allowed to read from 'ser'. It routes complete 'q' status
+        # responses to status_queue and records the poly/RDY tokens for the host.
+        in_status = False
+        status_buf = []
         while True:
             ser = ser_instance[0]
             if ser and ser.is_open:
@@ -145,7 +156,29 @@ def serial_worker(args):
                     line = ser.readline()
                     if line:
                         text = line.decode("utf-8", errors="ignore").strip()
-                        if text.startswith("[MCU]"):
+                        if text == "=== Modulator Status ===":
+                            in_status = True
+                            status_buf = [text]
+                        elif in_status:
+                            status_buf.append(text)
+                            # "Core 1 Headroom" is the final line of the 'q' response.
+                            if text.startswith("Core 1 Headroom"):
+                                status_queue.put(
+                                    "\n".join(status_buf).encode("utf-8")
+                                )
+                                in_status = False
+                                status_buf = []
+                        elif "poly toggled to" in text:
+                            # Firmware: "Randomizer poly toggled to 8-bit"
+                            try:
+                                mcu_poly = int(
+                                    text.split("poly toggled to ")[1].split("-bit")[0]
+                                )
+                            except ValueError:
+                                pass
+                        elif text == "RDY":
+                            ready_event.set()
+                        elif text.startswith("[MCU]"):
                             if "FIFO:" in text:
                                 try:
                                     mcu_fifo_level = int(
@@ -171,26 +204,29 @@ def serial_worker(args):
         try:
             print(f"[Serial] Connecting to {port} at {baud} baud...")
             ser = serial.Serial(port, baud, timeout=1.0, write_timeout=30.0)
+            # Point the reader daemon (sole reader) at this port immediately.
+            ser_instance[0] = ser
 
-            # Send 'q' to see if it responds with status
-            ser.write(b"q")
-            time.sleep(0.3)
-            response = ser.read_all()
-            if b"Modulator Status" not in response and b"Core 1 Headroom" not in response:
+            # Send 'q' to see if it responds with status (read via the daemon).
+            status, response = get_status(ser)
+            if not status:
                 print(
-                    "[Serial] MCU is unresponsive (likely in stream mode). Waiting 15 seconds for watchdog to timeout..."
+                    "[Serial] MCU is unresponsive (likely in stream mode). Waiting for the MCU to recover (no hardware watchdog is enabled); you may need to reset the device manually..."
                 )
                 time.sleep(15.5)
-                ser.read_all()
 
             print("[Serial] Restarting MCU...")
-            ser.write(b"m")
+            with write_lock:
+                ser.write(b"m")
+                ser.flush()
             time.sleep(1.5)
             ser.close()
+            ser_instance[0] = None
             time.sleep(0.5)
 
             print(f"[Serial] Reconnecting after MCU restart...")
             ser = serial.Serial(port, baud, timeout=10, write_timeout=30.0)
+            ser_instance[0] = ser
 
             status, response = get_status(ser)
             retry_count = 0
@@ -226,23 +262,25 @@ def serial_worker(args):
 
                 if args.rate is not None:
                     print(f"[Serial] Setting symbol rate to {args.rate} Hz...")
-                    ser.write(f"r{args.rate}\n".encode("utf-8"))
+                    with write_lock:
+                        ser.write(f"r{args.rate}\n".encode("utf-8"))
+                        ser.flush()
                     time.sleep(0.1)
-                    ser.read_all()
 
                 if args.crate is not None:
                     print(
                         f"[Serial] Setting convolutional rate to {['1/2','2/3','3/4','5/6','7/8'][args.crate]}..."
                     )
-                    ser.write(f"k{args.crate}\n".encode("utf-8"))
+                    with write_lock:
+                        ser.write(f"k{args.crate}\n".encode("utf-8"))
+                        ser.flush()
                     time.sleep(0.1)
-                    ser.read_all()
 
                 if args.inter is not None:
-                    print(f"[Serial] Setting RS interleave to {args.inter}...")
-                    ser.write(f"l{args.inter}\n".encode("utf-8"))
-                    time.sleep(0.1)
-                    ser.read_all()
+                    print(
+                        f"[WARN] Interleave is not supported by the current firmware "
+                        f"(no 'l' handler); --inter {args.inter} is ignored."
+                    )
 
                 if args.rs is not None:
                     if toggle_if_needed(ser, status, "RS (255,223)", args.rs == 1, "y"):
@@ -282,10 +320,30 @@ def serial_worker(args):
                     span = args.rrc_span if args.rrc_span is not None else curr_span
                     rrc_type = args.rrc_type if args.rrc_type is not None else curr_type
 
+                    # The firmware RRC table always uses a fixed 5-symbol span and
+                    # RRC only; warn when a value the firmware cannot honour is asked.
+                    if args.rrc_span is not None and args.rrc_span != 5:
+                        print(
+                            f"[WARN] RRC span {args.rrc_span} is not supported "
+                            f"by the current firmware (fixed 5-symbol span); it is ignored."
+                        )
+                    if args.rrc_type is not None and args.rrc_type != 1:
+                        print(
+                            f"[WARN] RRC type {args.rrc_type} is not supported by the "
+                            f"current firmware (RRC only); it is ignored."
+                        )
+                    if args.rrc_alpha is not None and args.rrc_alpha not in (0.25, 0.35, 0.5):
+                        print(
+                            f"[WARN] RRC alpha {args.rrc_alpha} is not in {{0.25, 0.35, 0.5}}; "
+                            f"coerced to 0.5."
+                        )
+                        alpha = 0.5
+
                     print(f"[Serial] Configuring RRC/RC filter: F 0 {span} {alpha} {rrc_type} (auto L)...")
-                    ser.write(f"F 0 {span} {alpha} {rrc_type}\n".encode("utf-8"))
+                    with write_lock:
+                        ser.write(f"F 0 {span} {alpha} {rrc_type}\n".encode("utf-8"))
+                        ser.flush()
                     time.sleep(0.1)
-                    ser.read_all()
                     status, _ = get_status(ser)
 
                 if args.rrc == 0:
@@ -358,24 +416,24 @@ def serial_worker(args):
                 pass
             print("[Serial] ------------------------------\n")
 
-            ser.write(b"s")
+            with write_lock:
+                ser.write(b"s")
+                ser.flush()
             time.sleep(1.0)
-            ser.read_all()
-            ser.write(b"u")
+            # Clear BEFORE requesting 'u' so a fast "RDY" from the reader daemon
+            # cannot be lost between the write and the wait.
+            ready_event.clear()
+            with write_lock:
+                ser.write(b"u")
+                ser.flush()
 
-            ready = False
-            start_wait = time.time()
-            response = b""
-            while time.time() - start_wait < 3.0:
-                response += ser.read_all()
-                if b"B" in response:
-                    ready = True
-                    break
-                time.sleep(0.05)
+            # The reader daemon sets ready_event on the dedicated "RDY" token the
+            # firmware emits when entering binary mode.
+            ready = ready_event.wait(timeout=3.0)
 
             if not ready:
                 print(
-                    "[Serial] Warning: Did not receive 'B' ready signal. Proceeding anyway."
+                    "[Serial] Warning: Did not receive 'RDY' ready signal. Proceeding anyway."
                 )
             else:
                 print("[Serial] Modulator locked into Binary Mode. Stream ready!")
@@ -413,9 +471,14 @@ def serial_worker(args):
                                 keep_alive_seq = (keep_alive_seq + 1) & 0x3FFF
 
                                 # Flow control before sending
-                                while mcu_fifo_level > TARGET_FIFO_LEVEL:
-                                    time.sleep(0.0001)
-                                ser.write(packet)
+                                deadline = time.time() + 5.0
+                                while mcu_fifo_level > TARGET_FIFO_LEVEL and time.time() < deadline:
+                                    time.sleep(0.001)
+                                if mcu_fifo_level > TARGET_FIFO_LEVEL:
+                                    print("[WARN] FIFO flow-control wait timed out; proceeding.")
+                                with write_lock:
+                                    ser.write(packet)
+                                    ser.flush()
                                 mcu_fifo_level += len(packet)
                                 # Reset timer so we don't send another immediately
                                 last_user_packet_time = time.time()
@@ -431,10 +494,15 @@ def serial_worker(args):
                 packet = generate_space_packet(apid, seq, payload)
 
                 # Flow control
-                while mcu_fifo_level > TARGET_FIFO_LEVEL:
-                    time.sleep(0.0001)
+                deadline = time.time() + 5.0
+                while mcu_fifo_level > TARGET_FIFO_LEVEL and time.time() < deadline:
+                    time.sleep(0.001)
+                if mcu_fifo_level > TARGET_FIFO_LEVEL:
+                    print("[WARN] FIFO flow-control wait timed out; proceeding.")
 
-                ser.write(packet)
+                with write_lock:
+                    ser.write(packet)
+                    ser.flush()
                 mcu_fifo_level += len(packet)
 
                 # Update the timestamp of the last user packet
@@ -511,8 +579,10 @@ def main():
         description="Continuous BPSK USB/TCP Modulator Service"
     )
     parser.add_argument("port", help="Serial port (e.g., COM3 or /dev/ttyACM0)")
+    # Firmware uses 921600. The RP2350 CDC console ignores baud, but UART
+    # transports would need it to match the firmware.
     parser.add_argument(
-        "--baud", type=int, default=12000000, help="Baud rate (default 12000000)"
+        "--baud", type=int, default=921600, help="Baud rate (default 921600)"
     )
     parser.add_argument(
         "--bind", default="0.0.0.0", help="TCP bind address (default 0.0.0.0)"

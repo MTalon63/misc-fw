@@ -1,7 +1,8 @@
 @echo off
-echo Starting Modulator Service on COM13 (LDPC Mode)...
+set "PORT=COM13"
+echo Starting Modulator Service on %PORT% (LDPC Mode)...
 
-python modulator_service.py COM13 ^
+python modulator_service.py %PORT% ^
     --rate 400000 ^
     --crate 2 ^
     --ldpc 1 ^

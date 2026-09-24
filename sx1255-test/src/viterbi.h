@@ -97,13 +97,4 @@ struct alignas(4) BPSKPunctureFastLut {
 
 static constexpr BPSKPunctureFastLut CCSDS_PUNC_FAST_LUT;
 
-static inline uint8_t conv_encode_bit(uint8_t in_bit, uint8_t &state) {
-    uint8_t c = (state << 1) | in_bit;
-    c = (uint8_t)(((c >> 1) | (in_bit << 6)) & 0x7F);
-    uint8_t g1 = bpsk_parity8(c & CONV_G1);
-    uint8_t g2 = bpsk_parity8(c & CONV_G2) ^ 1u;
-    state = c >> 1;
-    return (g1 << 1) | g2;
-}
-
-#endif // VITERBI_H
+#endif // VITERBI_H

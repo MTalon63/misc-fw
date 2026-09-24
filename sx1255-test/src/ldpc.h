@@ -8,7 +8,8 @@
 // Parity block: 1024 bits (128 bytes)
 // Total Codeword: 8160 bits (1020 bytes)
 
-// Encodes a byte-aligned 892-byte payload into a 1020-byte LDPC codeword
-void ldpc_78_encode(const uint8_t *info_bytes, uint16_t info_len, uint8_t *codeword_out);
+// In-place encode: buf already contains the info bytes at its start (offset 0).
+// On return the parity bytes occupy the parity region (offset info_len .. 1019).
+void ldpc_78_encode(uint8_t *buf, uint16_t info_len);
 
 #endif

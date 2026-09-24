@@ -145,16 +145,37 @@ static constexpr uint16_t FULL_PACKET_SIZE = 1024u;    // FRAME_CODED_BYTES + AS
 static constexpr uint32_t FRAME_UNCODED_BITS = (uint32_t)FRAME_CODED_BYTES * 8u;
 static constexpr uint32_t FRAME_ENC_BITS = FRAME_UNCODED_BITS * 2u; // rate-1/2
 
+// Max space-packet length bound = FIFO capacity minus one (reject only impossible values).
+static const uint32_t MAX_SP_PACKET_LEN = SP_FIFO_SIZE - 1;
+
 // Convolutional encoder state (persistent across frames for continuous stream)
 static uint8_t conv_state = 0u;
 
-// Frame counter (24-bit per CCSDS)
-static uint32_t frame_counter = 0u;
+// Per-VC 24-bit frame counters (64 virtual channels, 6-bit VCID). Each VC keeps
+// its own count; idle frames on VC 63 do not advance the user VC. (CCSDS
+// 732.0-B-5 §4.1.2.4.2)
+static uint32_t frame_counter[VCDU_NUM_VC] = {0u};
+// Per-VC 4-bit Frame Count Cycle; incremented when a VC's 24-bit count wraps to
+// zero (CCSDS 732.0-B-5 §4.1.2.5.5.2). NOTE: aggregate init `{1u}` would set
+// ONLY element [0] to 1 and zero the rest, so every VC's cycle is seeded to 1
+// explicitly in setup() (see there) to match the previous hard-coded on-air
+// value of 1 for all VCs, including idle VC 63.
+static uint8_t frame_counter_cycle[VCDU_NUM_VC] = {0u};
 
 // Frequency calibration variables
 static double current_freq_hz = 436500000.0;
 static double freq_offset_hz = 0.0;
 static bool cw_mode = false;
+
+// Calibration clamp limits: keep values inside the int16 RRC table range so
+// large calibration values cannot overflow and silently corrupt modulation.
+static const int32_t CAL_GAIN_LIMIT   = 1024;   // q_gain_cal / phase_cal
+static const int32_t CAL_OFFSET_LIMIT = 8192;   // i_dc_offset / q_dc_offset
+
+// Digital DAC scaling: single default (clamp-branch value) plus hardening range.
+static const float DEFAULT_DIGITAL_SCALE = 12000.0f;
+static const float DIGITAL_SCALE_MIN = 4000.0f;
+static const float DIGITAL_SCALE_MAX = 30000.0f;
 
 static int16_t q_gain_cal = 0;
 static int16_t phase_cal = 0;
@@ -163,7 +184,7 @@ static int16_t q_dc_offset = 0;
 static uint8_t dac_gain_idx =
     3; // Default 0 dBFS (max gain, same as original config)
 static uint8_t mixer_gain = 14; // Default 14 (0x0E, same as original config)
-static float digital_scale = 3000.0f; // Default 11000
+static float digital_scale = DEFAULT_DIGITAL_SCALE;
 
 static void update_tx_frequency(void) {
   double target_freq = current_freq_hz + freq_offset_hz;
@@ -211,34 +232,32 @@ static void print_help(void) {
   Serial.println("  c - Toggle CCSDS convolutional encoding");
   Serial.println("  k <rate> - Set convolutional puncturing rate (0=1/2, "
                  "1=2/3, 2=3/4, 3=5/6, 4=7/8)");
-  Serial.println("  n - Toggle CCSDS randomizer (Not mapped here, fixed)");
-  Serial.println("  N - Toggle NRZ-M Encoding");
+  Serial.println("  n - Toggle CCSDS randomizer ON/OFF");
+  Serial.println("  N - Toggle CCSDS randomizer polynomial (8-bit / 17-bit)");
+  Serial.println("  x - Toggle NRZ-M Encoding");
   Serial.println("  q - Print upload/FIFO status");
-  Serial.println("  l <count> - Set Reed-Solomon interleaver depth (Not mapped "
-                 "here, fixed 4)");
-  Serial.println("  t <data> - Transmit message (ASCII text, Not mapped here)");
   Serial.println("  y - Toggle Reed-Solomon (255,223) I=4 encoding");
-  Serial.println("  e - Toggle Frame Error Control Field (FECF) (Not mapped here)");
-  Serial.println("  D - Toggle LDPC encoding");
+  Serial.println("  L - Toggle LDPC encoding");
+  Serial.println("  e - Toggle Frame Error Control Field (FECF)");
   Serial.println("  u - Binary upload mode (raw Space Packets, timeout 15s exits)");
   Serial.println("  m - Restart whole microcontroller");
   Serial.println("  W - Toggle RRC/RC pulse shaping filter");
-  Serial.println("  M <mode> - Set modulation mode (0=BPSK, 1=QPSK, 5=OQPSK, "
-                 "Not mapped here)");
   Serial.println("  h - Print this help menu");
   Serial.println("--- SX1255 Specific ---");
   Serial.println("  o - Toggle Modulation Mode (QPSK / OQPSK)");
+  Serial.println("  O - Toggle OQPSK Q Delay (Leads I / Lags I)");
   Serial.println("  P - Toggle Polynomial Swap (G1 / G2)");
   Serial.println("  I - Toggle G2 Inversion");
   Serial.println("  S - Toggle IQ Swap");
   Serial.println("  A - Cycle RRC Alpha (0.5 -> 0.35 -> 0.25)");
+  Serial.println("  F <min_dac> <span> <alpha> - Set RRC filter parameters");
   Serial.println("  + / -  - Increase/Decrease freq offset by 100 Hz");
   Serial.println("  ] / [  - Increase/Decrease freq offset by 10 Hz");
   Serial.println("  } / {  - Increase/Decrease freq offset by 1.0 Hz");
   Serial.println("  > / <  - Increase/Decrease freq offset by 0.1 Hz");
   Serial.println("  g - Cycle SX1255 DAC Gain (0dB, -3dB, -6dB, -9dB)");
   Serial.println("  f - Cycle SX1255 Mixer Gain (0 to -16dB)");
-  Serial.println("  K / L  - Increase/Decrease Q Gain Calibration");
+  Serial.println("  K / ;  - Increase/Decrease Q Gain Calibration");
   Serial.println("  . / ,  - Increase/Decrease IQ Phase Calibration");
   Serial.println("  J / j  - Increase/Decrease I DC Offset by 10");
   Serial.println("  C / d  - Increase/Decrease Q DC Offset by 10");
@@ -288,20 +307,31 @@ static inline uint8_t encode_nrzm_byte(uint8_t b) {
   return out;
 }
 
+static inline uint16_t frame_payload_size(void) {
+  uint16_t parity_size = (use_rs || use_ldpc) ? FRAME_PARITY_BYTES : 0;
+  uint16_t sz =
+      (uint16_t)(FRAME_CODED_BYTES - parity_size - VCDU_HEADER_SIZE -
+                 MPDU_HEADER_SIZE);
+  if (use_fecf) sz -= 2u;  // FECF occupies the last 2 payload bytes
+  return sz;
+}
+
 static void build_vcdu_header(uint8_t *frame, uint8_t vcid) {
   frame[0] =
       (VCDU_TRANSFER_FRAME_VERSION << 6) | ((VCDU_SPACECRAFT_ID >> 2) & 0x3F);
   frame[1] = ((VCDU_SPACECRAFT_ID & 0x03) << 6) | (vcid & 0x3F);
-  frame[2] = (frame_counter >> 16) & 0xFF;
-  frame[3] = (frame_counter >> 8) & 0xFF;
-  frame[4] = frame_counter & 0xFF;
+  uint8_t vc = vcid & 0x3F;
+  frame[2] = (frame_counter[vc] >> 16) & 0xFF;
+  frame[3] = (frame_counter[vc] >> 8) & 0xFF;
+  frame[4] = frame_counter[vc] & 0xFF;
   frame[5] = (VCDU_REPLAY_FLAG << 7) | (VCDU_CYCLE_USE_FLAG << 6) |
-             ((VCDU_SPACECRAFT_ID >> 8) & 0x03) << 4 |
-             (VCDU_FRAME_COUNT_CYCLE & 0x0F);
+             (((VCDU_SPACECRAFT_ID >> 8) & 0x03) << 4) |
+             (frame_counter_cycle[vc & 0x3F] & 0x0F);
 }
 
 // 131072-bit circular buffer for raw output stream
-static uint8_t tx_bit_fifo[TX_FIFO_SIZE];
+static uint8_t tx_bit_fifo[TX_FIFO_SIZE]
+    __attribute__((section(".uninitialized")));
 static volatile uint32_t tx_fifo_wptr = 0;   // write pointer
 static volatile uint32_t tx_fifo_rptr_i = 0; // read pointer for I
 static volatile uint32_t tx_fifo_rptr_q =
@@ -319,10 +349,7 @@ static bool __not_in_flash_func(has_data_to_send)() {
   if (current_sp_offset < current_sp_size) {
     if (is_filler)
       return true;
-    uint16_t length_to_crc = FRAME_CODED_BYTES;
-    uint16_t rs_parity_size = use_rs ? FRAME_PARITY_BYTES : 0;
-    uint16_t payload_size =
-        length_to_crc - rs_parity_size - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
+    uint16_t payload_size = frame_payload_size();
     uint32_t bytes_needed = current_sp_size - current_sp_offset;
     if (bytes_needed > payload_size)
       bytes_needed = payload_size;
@@ -333,21 +360,28 @@ static bool __not_in_flash_func(has_data_to_send)() {
   if (get_sp_fifo_free() == 0)
     return true; // FIFO is full
   if (fifo_count >= 6) {
-    if ((peek_sp_byte(0) & 0xE0) != 0x00)
-      return true;
-    uint16_t pdl = (peek_sp_byte(4) << 8) | peek_sp_byte(5);
-    uint32_t total_len = pdl + 7;
-    if (total_len >= SP_FIFO_SIZE)
-      return true; // Corrupted length
-    if (fifo_count >= total_len)
-      return true;
+    while (get_sp_fifo_count() >= 6) {
+      if ((peek_sp_byte(0) & 0xF8) != 0x00) { // version==0, type==0, sec-hdr==0
+        pop_sp_byte();
+        continue;
+      }
+      uint16_t pdl = (peek_sp_byte(4) << 8) | peek_sp_byte(5);
+      uint32_t total_len = pdl + 7;
+      if (total_len < 7 || total_len > MAX_SP_PACKET_LEN) {
+        pop_sp_byte();
+        continue;
+      }
+      if (get_sp_fifo_count() >= total_len)
+        return true;
+      break;
+    }
   }
   return false;
 }
 
 static void __not_in_flash_func(generate_next_frame)(void) {
   uint32_t tf_bytes = FRAME_CODED_BYTES;
-  uint8_t local_frame[FULL_PACKET_SIZE];
+  static uint8_t local_frame[FULL_PACKET_SIZE];
 
   uint32_t t_bb = time_us_32();
   bool has_data = has_data_to_send();
@@ -359,9 +393,7 @@ static void __not_in_flash_func(generate_next_frame)(void) {
     tx_user_frames_generated++;
 
   uint16_t fhp = MPDU_NO_START_PACKET;
-  uint16_t parity_size = (use_rs || use_ldpc) ? FRAME_PARITY_BYTES : 0;
-  uint16_t payload_size =
-      tf_bytes - parity_size - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
+  uint16_t payload_size = frame_payload_size();
 
   for (uint16_t i = 0; i < payload_size; i++) {
     if (current_sp_offset >= current_sp_size) {
@@ -370,13 +402,13 @@ static void __not_in_flash_func(generate_next_frame)(void) {
       is_filler = false;
 
       while (has_data && get_sp_fifo_count() >= 6) {
-        if ((peek_sp_byte(0) & 0xE0) != 0x00) {
+        if ((peek_sp_byte(0) & 0xF8) != 0x00) { // version==0, type==0, sec-hdr==0
           pop_sp_byte();
           continue;
         }
         uint16_t pdl = (peek_sp_byte(4) << 8) | peek_sp_byte(5);
         uint32_t total_len = pdl + 7;
-        if (total_len >= SP_FIFO_SIZE) {
+        if (total_len < 7 || total_len > MAX_SP_PACKET_LEN) {
           pop_sp_byte();
           continue;
         }
@@ -389,12 +421,18 @@ static void __not_in_flash_func(generate_next_frame)(void) {
       }
 
       if (current_sp_size == 0) {
+        if (i >= payload_size) break;
         uint16_t remaining = payload_size - i;
         uint16_t filler_size = (remaining >= 7) ? remaining : 7;
         current_sp_size = filler_size;
         is_filler = true;
-        if (fhp == MPDU_NO_START_PACKET)
-          fhp = i;
+        if (fhp == MPDU_NO_START_PACKET && i == 0) {
+          // The M_PDU Packet Zone is entirely idle fill: emit the 'all ones minus
+          // one' idle-data sentinel (CCSDS 732.0-B-5 §4.1.4.2.2.5 / §4.1.4.2.3.4).
+          // Guard i == 0 so a zone that carries a prior packet/continuation
+          // (FHP legitimately 'no start' = 0xFFFF) is not mis-signalled.
+          fhp = MPDU_IDLE_DATA;
+        }
 
         filler_header[0] = 0x07;
         filler_header[1] = 0xFF;
@@ -415,20 +453,29 @@ static void __not_in_flash_func(generate_next_frame)(void) {
         local_frame[VCDU_HEADER_SIZE + MPDU_HEADER_SIZE + i] = 0xFF;
       }
       current_sp_offset++;
-    } else {
+    } else if (get_sp_fifo_count() > 0) {
       local_frame[VCDU_HEADER_SIZE + MPDU_HEADER_SIZE + i] = pop_sp_byte();
       current_sp_offset++;
+    } else {
+      // Starved mid-packet: do not consume; emit idle fill and hold packet state
+      // so the partially-framed packet resumes in a later call. (CCSDS 732.0-B-5
+      // §4.1.4.1.5 / §4.1.4.2.3.4: emit idle fill when no valid data is ready.)
+      local_frame[VCDU_HEADER_SIZE + MPDU_HEADER_SIZE + i] = 0xFF;
     }
   }
 
-  // MPDU Header
-  local_frame[VCDU_HEADER_SIZE] = (fhp >> 8) & 0x07;
-  local_frame[VCDU_HEADER_SIZE + 1] = fhp & 0xFF;
+  // MPDU Header (First Header Pointer is 16 bits in CCSDS 732.0-B-5 §4.1.4.2.2.1)
+  local_frame[VCDU_HEADER_SIZE] = (fhp >> 8) & 0xFF; // FHP high byte (bits 15..8)
+  local_frame[VCDU_HEADER_SIZE + 1] = fhp & 0xFF;    // FHP low byte (bits 7..0)
 
   if (use_fecf) {
-    uint16_t length_to_crc = FRAME_PAYLOAD_LIMIT - 2;
+    // FECF sits at the true end of the uncoded frame: FRAME_PAYLOAD_LIMIT-2 when
+    // RS/LDPC is active, otherwise the full uncoded frame FRAME_CODED_BYTES-2.
+    uint16_t crc_off = (use_rs || use_ldpc)
+                           ? (uint16_t)(FRAME_PAYLOAD_LIMIT - 2)
+                           : (uint16_t)(FRAME_CODED_BYTES - 2);
     uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < length_to_crc; i++) {
+    for (uint16_t i = 0; i < crc_off; i++) {
       crc ^= (local_frame[i] << 8);
       for (uint8_t j = 0; j < 8; j++) {
         if (crc & 0x8000)
@@ -437,21 +484,19 @@ static void __not_in_flash_func(generate_next_frame)(void) {
           crc = (crc << 1);
       }
     }
-    local_frame[length_to_crc] = (crc >> 8) & 0xFF;
-    local_frame[length_to_crc + 1] = crc & 0xFF;
+    local_frame[crc_off] = (crc >> 8) & 0xFF;
+    local_frame[crc_off + 1] = crc & 0xFF;
   }
 
   // Apply FEC encoding if enabled (overwrites the last FRAME_PARITY_BYTES bytes with parity)
   if (use_ldpc) {
-    uint8_t temp[1020];
-    ldpc_78_encode(local_frame, FRAME_PAYLOAD_LIMIT, temp);
-    memcpy(local_frame, temp, 1020);
+    ldpc_78_encode(local_frame, FRAME_PAYLOAD_LIMIT);
   } else if (use_rs) {
     rs_encode_interleaved(&local_frame[0], &local_frame[FRAME_PAYLOAD_LIMIT], 4);
   }
 
   // Combine ASM and randomized payload into a single 1024-byte packet
-  uint8_t full_packet[FULL_PACKET_SIZE];
+  static uint8_t full_packet[FULL_PACKET_SIZE];
 
   // ASM is 4 bytes, unrandomized
   full_packet[0] = 0x1A;
@@ -537,8 +582,14 @@ static void __not_in_flash_func(generate_next_frame)(void) {
     tx_fifo_wptr = local_wptr;
   }
 
-  // Increment frame counter
-  frame_counter = (frame_counter + 1) & 0xFFFFFF;
+  // Increment the emitted VC's frame counter only (CCSDS 732.0-B-5 §4.1.2.4.2).
+  uint8_t vc = vcid & 0x3F;
+  frame_counter[vc] = (frame_counter[vc] + 1u) & 0xFFFFFFu;
+  if (frame_counter[vc] == 0u) {
+    // Frame Count returned to zero: increment this VC's 4-bit Cycle
+    // (CCSDS 732.0-B-5 §4.1.2.5.5.2).
+    frame_counter_cycle[vc] = (uint8_t)((frame_counter_cycle[vc] + 1u) & 0x0F);
+  }
   perf_bb_us = time_us_32() - t_bb;
 }
 
@@ -849,9 +900,19 @@ static void init_rrc_table(void) {
       // the peak amplitude of the bypass mode!
       int16_t base_val = (int16_t)((sum / 1.35f) * digital_scale);
 
-      rrc_table_i[pattern][p] = base_val + i_dc;
-      rrc_table_q_main[pattern][p] = base_val + (((int32_t)base_val * gain_cal) >> 10) + q_dc;
-      rrc_table_q_cross[pattern][p] = -(((int32_t)base_val * ph_cal) >> 10);
+      // Saturate each final value to the int16 range before storing so a large
+      // calibration never wraps and silently corrupts the modulation.
+      int32_t v_i = base_val + i_dc;
+      if (v_i > 32767) v_i = 32767; else if (v_i < -32768) v_i = -32768;
+      rrc_table_i[pattern][p] = (int16_t)v_i;
+
+      int32_t v_q_main = base_val + (((int32_t)base_val * gain_cal) >> 10) + q_dc;
+      if (v_q_main > 32767) v_q_main = 32767; else if (v_q_main < -32768) v_q_main = -32768;
+      rrc_table_q_main[pattern][p] = (int16_t)v_q_main;
+
+      int32_t v_q_cross = -(((int32_t)base_val * ph_cal) >> 10);
+      if (v_q_cross > 32767) v_q_cross = 32767; else if (v_q_cross < -32768) v_q_cross = -32768;
+      rrc_table_q_cross[pattern][p] = (int16_t)v_q_cross;
     }
   }
 }
@@ -922,8 +983,14 @@ void setup() {
       mixer_gain = 14;
     if (dac_gain_idx > 3)
       dac_gain_idx = 3;
-    if (digital_scale < 4000.0f || digital_scale > 30000.0f)
-      digital_scale = 12000.0f;
+    // Clamp any out-of-range loaded calibration values to the same limits
+    // used by the serial command handlers.
+    q_gain_cal  = constrain(q_gain_cal,  -CAL_GAIN_LIMIT,   CAL_GAIN_LIMIT);
+    phase_cal   = constrain(phase_cal,   -CAL_GAIN_LIMIT,   CAL_GAIN_LIMIT);
+    i_dc_offset = constrain(i_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
+    q_dc_offset = constrain(q_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
+    if (digital_scale < DIGITAL_SCALE_MIN || digital_scale > DIGITAL_SCALE_MAX)
+      digital_scale = DEFAULT_DIGITAL_SCALE;
     Serial.printf("Loaded calibrations: FreqOffset=%.2f Hz, QGain=%d/1024, "
                   "Phase=%d/1024, "
                   "MixerGain=%d, DACGainIdx=%d, DigitalScale=%.1f, IDC=%d, "
@@ -938,7 +1005,12 @@ void setup() {
     q_dc_offset = 0;
     mixer_gain = 14;
     dac_gain_idx = 3;
-    digital_scale = 11000.0f;
+    // Apply the same clamping to the fallback defaults (values are 0/in-range).
+    q_gain_cal  = constrain(q_gain_cal,  -CAL_GAIN_LIMIT,   CAL_GAIN_LIMIT);
+    phase_cal   = constrain(phase_cal,   -CAL_GAIN_LIMIT,   CAL_GAIN_LIMIT);
+    i_dc_offset = constrain(i_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
+    q_dc_offset = constrain(q_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
+    digital_scale = DEFAULT_DIGITAL_SCALE;
     Serial.println("No calibration data in EEPROM (defaulting to 0/defaults)");
   }
 
@@ -1016,6 +1088,12 @@ void setup() {
   Serial.printf("Symbol rate = %lu Hz (OSR=%lu)\n", symbol_rate_hz,
                 cycles_per_symbol);
 
+  // Seed every VC's Frame Count Cycle to 1 (portable explicit loop; a partial
+  // aggregate initialiser would leave VCs 1..63 at 0). This keeps byte-5 bits
+  // 44-47 identical to the previous hard-coded on-air value of 1 for all VCs,
+  // including idle VC 63. Must run before the first generate_next_frame().
+  for (uint8_t c = 0; c < VCDU_NUM_VC; c++) frame_counter_cycle[c] = 1u;
+
   // --- Pre-fill bit FIFO with 4 frames to prevent initial underflow ---
   generate_next_frame();
   generate_next_frame();
@@ -1073,6 +1151,24 @@ void setup() {
 // ============================================================
 // Loop: keep FIFO topped up
 // ============================================================
+
+// Shared symbols-per-frame value used by the status query and telemetry paths
+static uint32_t symbols_per_frame(void) {
+  uint32_t n = FRAME_CODED_BYTES * 8;
+  if (use_conv) {
+    if (puncturing_rate == 0)
+      n *= 2;
+    else if (puncturing_rate == 1)
+      n = (n * 4) / 3;
+    else if (puncturing_rate == 2)
+      n = (n * 5) / 4;
+    else if (puncturing_rate == 3)
+      n = (n * 6) / 5;
+    else if (puncturing_rate == 4)
+      n = (n * 8) / 7;
+  }
+  return n;
+}
 
 static void process_input(char mode, const char *data) {
   if (mode == 'r') {
@@ -1136,6 +1232,7 @@ static void process_input(char mode, const char *data) {
     last_binary_rx_ms = millis();
     Serial.println(
         "Binary upload mode enabled. Waiting for raw Space Packets...");
+    Serial.print("RDY\n");
     Serial.println("Will exit after 15s of inactivity.");
   } else if (mode == 'm') {
     rp2040.reboot();
@@ -1221,34 +1318,42 @@ static void process_input(char mode, const char *data) {
     Serial.printf("TX Mixer Gain: -%d dB\n", (int)mixer_gain * 2 - 28);
   } else if (mode == 'K') {
     q_gain_cal += 8;
+    q_gain_cal = constrain(q_gain_cal, -CAL_GAIN_LIMIT, CAL_GAIN_LIMIT);
     init_rrc_table();
     Serial.printf("Q Gain: %d\n", q_gain_cal);
   } else if (mode == ';') {
     q_gain_cal -= 8;
+    q_gain_cal = constrain(q_gain_cal, -CAL_GAIN_LIMIT, CAL_GAIN_LIMIT);
     init_rrc_table();
     Serial.printf("Q Gain: %d\n", q_gain_cal);
   } else if (mode == '.') {
     phase_cal += 8;
+    phase_cal = constrain(phase_cal, -CAL_GAIN_LIMIT, CAL_GAIN_LIMIT);
     init_rrc_table();
     Serial.printf("Phase: %d\n", phase_cal);
   } else if (mode == ',') {
     phase_cal -= 8;
+    phase_cal = constrain(phase_cal, -CAL_GAIN_LIMIT, CAL_GAIN_LIMIT);
     init_rrc_table();
     Serial.printf("Phase: %d\n", phase_cal);
   } else if (mode == 'J') {
     i_dc_offset += 10;
+    i_dc_offset = constrain(i_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
     init_rrc_table();
     Serial.printf("I DC: %d\n", i_dc_offset);
   } else if (mode == 'j') {
     i_dc_offset -= 10;
+    i_dc_offset = constrain(i_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
     init_rrc_table();
     Serial.printf("I DC: %d\n", i_dc_offset);
   } else if (mode == 'C') {
     q_dc_offset += 10;
+    q_dc_offset = constrain(q_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
     init_rrc_table();
     Serial.printf("Q DC: %d\n", q_dc_offset);
   } else if (mode == 'd') {
     q_dc_offset -= 10;
+    q_dc_offset = constrain(q_dc_offset, -CAL_OFFSET_LIMIT, CAL_OFFSET_LIMIT);
     init_rrc_table();
     Serial.printf("Q DC: %d\n", q_dc_offset);
   } else if (mode == 'z') {
@@ -1296,42 +1401,30 @@ static void process_input(char mode, const char *data) {
     Serial.printf("FIFO Buffered: %u bytes\n", get_sp_fifo_count());
     Serial.printf("FIFO Free: %u bytes\n", get_sp_fifo_free());
     Serial.printf("DMA Underflows: %u\n", tx_dma_underflows);
-    Serial.printf("VCDUs Transmitted: %u\n", frame_counter);
+    Serial.printf("VCDUs Transmitted: %u user (VC%u) + %u idle (VC%u)\n",
+                  frame_counter[VCDU_DEFAULT_VCID], VCDU_DEFAULT_VCID,
+                  frame_counter[0x3F], 0x3F);
     Serial.printf("User Frames Encapsulated: %u\n", tx_user_frames_generated);
     Serial.printf("CPU BB Time: %u us\n", perf_bb_us);
     Serial.printf("CPU Mod Time: %u us\n", last_refill_duration_us);
-    Serial.printf("RRC Filter: %s (Type: RRC, alpha=%.2f, span=8)\n",
+    Serial.printf("RRC Filter: %s (Type: RRC, alpha=%.2f, span=5 symbols)\n",
                   use_rrc ? "ON" : "BYPASSED", rrc_alpha);
     Serial.printf("Randomizer: %s (Poly: %u-bit)\n",
                   use_randomizer ? "ON" : "OFF", randomizer_poly);
     Serial.printf("Convolutional: %s\n", use_conv ? "ON" : "OFF");
     Serial.printf("Puncturing Rate: %d\n", puncturing_rate);
-    Serial.printf("Frame Size: 1024 bytes\n");
+    Serial.printf("Frame Size: 1024 bytes (incl. 4-byte ASM; AOS transfer frame = 1020 bytes)\n");
     Serial.printf("RS Interleave: 4\n");
     Serial.printf("RS (255,223): %s\n", use_rs ? "ON" : "OFF");
     Serial.printf("LDPC (8160,7136): %s\n", use_ldpc ? "ON" : "OFF");
     Serial.printf("FECF (CRC-16): %s\n", use_fecf ? "ON" : "OFF");
 
-    uint16_t parity_size = (use_rs || use_ldpc) ? FRAME_PARITY_BYTES : 0;
-    uint16_t expected_payload = FRAME_CODED_BYTES - parity_size -
-                                VCDU_HEADER_SIZE - MPDU_HEADER_SIZE - (use_fecf ? 2 : 0);
+    uint16_t expected_payload = frame_payload_size();
     Serial.printf("Expected Payload: %u bytes\n", expected_payload);
 
-    uint32_t symbols_per_frame = FRAME_CODED_BYTES * 8;
-    if (use_conv) {
-      if (puncturing_rate == 0)
-        symbols_per_frame *= 2;
-      else if (puncturing_rate == 1)
-        symbols_per_frame = (symbols_per_frame * 4) / 3;
-      else if (puncturing_rate == 2)
-        symbols_per_frame = (symbols_per_frame * 5) / 4;
-      else if (puncturing_rate == 3)
-        symbols_per_frame = (symbols_per_frame * 6) / 5;
-      else if (puncturing_rate == 4)
-        symbols_per_frame = (symbols_per_frame * 8) / 7;
-    }
+    uint32_t spf = symbols_per_frame();
     uint32_t frame_tx_time_us =
-        (uint32_t)((symbols_per_frame * 1000000ULL) /
+        (uint32_t)((spf * 1000000ULL) /
                    (symbol_rate_hz * (use_oqpsk ? 2 : 1)));
     float core0_headroom_pct =
         (1.0f - ((float)perf_bb_us / (float)frame_tx_time_us)) * 100.0f;
@@ -1346,6 +1439,8 @@ static void process_input(char mode, const char *data) {
     Serial.printf("Core 1 Headroom: %.1f%%\n", core1_headroom_pct);
   } else if (mode == 'h') {
     print_help();
+  } else {
+    Serial.printf("Unknown command: '%c' (type 'h' for help)\n", mode);
   }
 }
 
@@ -1366,21 +1461,9 @@ void loop() {
     if (millis() - last_telemetry_ms >= 1000) {
       last_telemetry_ms = millis();
 
-      uint32_t symbols_per_frame = FRAME_CODED_BYTES * 8;
-      if (use_conv) {
-        if (puncturing_rate == 0)
-          symbols_per_frame *= 2;
-        else if (puncturing_rate == 1)
-          symbols_per_frame = (symbols_per_frame * 4) / 3;
-        else if (puncturing_rate == 2)
-          symbols_per_frame = (symbols_per_frame * 5) / 4;
-        else if (puncturing_rate == 3)
-          symbols_per_frame = (symbols_per_frame * 6) / 5;
-        else if (puncturing_rate == 4)
-          symbols_per_frame = (symbols_per_frame * 8) / 7;
-      }
+      uint32_t spf = symbols_per_frame();
       uint32_t frame_tx_time_us =
-          (uint32_t)((symbols_per_frame * 1000000ULL) /
+          (uint32_t)((spf * 1000000ULL) /
                      (symbol_rate_hz * (use_oqpsk ? 2 : 1)));
       float core0_headroom_pct =
           (1.0f - ((float)perf_bb_us / (float)frame_tx_time_us)) * 100.0f;
@@ -1548,6 +1631,7 @@ void __not_in_flash_func(loop1)() {
         SD_STATE_LOAD;
         const bool _swap_iq = swap_iq;
         const bool _swap_pins = swap_pins;
+        const int32_t ds = (int32_t)digital_scale;
         for (uint32_t i = 0; i < DMA_BUF_SIZE; i++) {
           uint32_t word = 0;
 #pragma GCC unroll 16
@@ -1568,8 +1652,8 @@ void __not_in_flash_func(loop1)() {
             int symbol_q = (q_pattern >> 2) & 1;
             int symbol_actual_i = _swap_iq ? symbol_q : symbol_i;
             int symbol_actual_q = _swap_iq ? symbol_i : symbol_q;
-            int32_t val_i = symbol_actual_i ? (int32_t)digital_scale : -(int32_t)digital_scale;
-            int32_t val_q = symbol_actual_q ? (int32_t)digital_scale : -(int32_t)digital_scale;
+            int32_t val_i = symbol_actual_i ? ds : -ds;
+            int32_t val_q = symbol_actual_q ? ds : -ds;
             int32_t val_i_cal = val_i + _i_dc;
             int32_t val_q_cal = val_q + ((val_q * _gain_cal) >> 10) - ((val_i * _ph_cal) >> 10) + _q_dc;
             acc1_i += val_i_cal - local_fb_i;

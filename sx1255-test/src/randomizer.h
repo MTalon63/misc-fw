@@ -23,6 +23,13 @@ static constexpr uint8_t CCSDS_RANDOMIZER[255] = {
     0x4B, 0xBE, 0xE6, 0x19, 0x51, 0x5F, 0x9F, 0x05, 0x08, 0x78, 0xC4, 0x4A, 0x66, 0xF5, 0x58,
 };
 
+// ---------------------------------------------------------------------------
+// CCSDS 17-bit pseudo-randomizer (x^17 + x^14 + 1), per CCSDS 131.0-B-6
+// sec.10.4.1/10.4.3, implemented as an equivalent LFSR realization.
+// Mirrored taps {16,2} vs CCSDS {0,14}, bit-reversed seed 0x38E3 vs 0x18E38,
+// opposite shift orientation; produces the same output sequence as the
+// standard (verified against the documented 1C 71 B9 1B A9 ... pattern).
+// ---------------------------------------------------------------------------
 struct alignas(4) BPSKRandomizer17FastLut {
     uint8_t seq[1024];
     constexpr BPSKRandomizer17FastLut() : seq{} {

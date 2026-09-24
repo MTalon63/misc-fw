@@ -74,10 +74,11 @@ bool SX1255::checkVersion() { return readReg(REG_VERSION) == 0x11; }
 bool SX1255::enableXOSC() {
   writeReg(REG_MODE, MODE_REF_EN);
   uint32_t timeout = 1000;
-  while (!(readReg(REG_STAT) & STAT_XOSC_READY) && timeout--) {
+  bool xosc_ready = false;
+  while (!(xosc_ready = readReg(REG_STAT) & STAT_XOSC_READY) && timeout--) {
     delay(1);
   }
-  return (readReg(REG_STAT) & STAT_XOSC_READY);
+  return xosc_ready;
 }
 
 void SX1255::setFrequency(double freq_hz) {
@@ -104,7 +105,10 @@ void SX1255::setIismModeA() {
 }
 
 void SX1255::setClockSelectTxDac() {
-  writeReg(REG_CK_SEL, 0x00); // Select internal 32 MHz XOSC for DAC clock
+  // CK_SEL bit0 (clk_sel_tx_dac): 0 = internal clock (CLK_XTAL),
+  // 1 = external clock (CLK_IN). Factual per datasheet; not asserting a choice.
+  // NOTE: value intentionally unchanged; clock-source selection pending hardware verification.
+  writeReg(REG_CK_SEL, 0x00);
 }
 
 void SX1255::enableTx() {
@@ -112,8 +116,9 @@ void SX1255::enableTx() {
 }
 
 bool SX1255::waitForTxPllLock(uint32_t timeout_ms) {
-  while (!(readReg(REG_STAT) & STAT_PLL_LOCK_TX) && timeout_ms--) {
+  bool pll_lock = false;
+  while (!(pll_lock = readReg(REG_STAT) & STAT_PLL_LOCK_TX) && timeout_ms--) {
     delay(1);
   }
-  return (readReg(REG_STAT) & STAT_PLL_LOCK_TX);
+  return pll_lock;
 }
