@@ -114,7 +114,7 @@ static void apply_symbol_rate(uint32_t rate_hz) {
 static constexpr uint32_t Q_OFFSET_CYCLES = 0u;
 
 // PIO / SM
-static spi_inst_t *spi = spi0;
+static spi_inst_t *spi = spi1;
 static PIO pio = pio0;
 static uint sm = 0;
 
