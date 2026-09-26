@@ -257,6 +257,7 @@ static void print_help(void) {
   Serial.println("  > / <  - Increase/Decrease freq offset by 0.1 Hz");
   Serial.println("  g - Cycle SX1255 DAC Gain (0dB, -3dB, -6dB, -9dB)");
   Serial.println("  f - Cycle SX1255 Mixer Gain (0 to -16dB)");
+  Serial.println("  G <dac 0-3> <mixer 0-15> [scale 4000-16000] - Set absolute TX gain");
   Serial.println("  K / ;  - Increase/Decrease Q Gain Calibration");
   Serial.println("  . / ,  - Increase/Decrease IQ Phase Calibration");
   Serial.println("  J / j  - Increase/Decrease I DC Offset by 10");
@@ -1316,6 +1317,27 @@ static void process_input(char mode, const char *data) {
     }
     sx.setTxGain(dac_gain_idx, mixer_gain);
     Serial.printf("TX Mixer Gain: -%d dB\n", (int)mixer_gain * 2 - 28);
+  } else if (mode == 'G') {
+    // Absolute TX gain setter: G <dac 0-3> <mixer 0-15> [scale 4000-16000]
+    int _dac = 3, _mix = 14, _scale = 0;
+    int n = sscanf(data, "%d %d %d", &_dac, &_mix, &_scale);
+    if (n >= 2) {
+      dac_gain_idx = (uint8_t)constrain(_dac, 0, 3);
+      mixer_gain = (uint8_t)constrain(_mix, 0, 15);
+      sx.setTxGain(dac_gain_idx, mixer_gain);
+      if (n >= 3) {
+        float ns = constrain((float)_scale, 4000.0f, 16000.0f);
+        if (ns != digital_scale) {
+          digital_scale = ns;
+          init_rrc_table();
+        }
+      }
+      Serial.printf("TX Gain Set: dac=%u mixer=%u scale=%d\n",
+                    dac_gain_idx, mixer_gain, (int)digital_scale);
+    } else {
+      Serial.println(
+          "Invalid G command (use: G <dac 0-3> <mixer 0-15> [scale 4000-16000])");
+    }
   } else if (mode == 'K') {
     q_gain_cal += 8;
     q_gain_cal = constrain(q_gain_cal, -CAL_GAIN_LIMIT, CAL_GAIN_LIMIT);
@@ -1491,7 +1513,8 @@ void loop() {
       char c = Serial.read();
 
       if (!waiting_for_input) {
-        if (c == 'r' || c == 'k' || c == 'l' || c == 't' || c == 'M' || c == 'F') {
+        if (c == 'r' || c == 'k' || c == 'l' || c == 't' || c == 'M' || c == 'F' ||
+            c == 'G') {
           input_mode = c;
           waiting_for_input = true;
           input_idx = 0;
@@ -1523,8 +1546,16 @@ void loop() {
   // Refill the bit FIFO for core 1
   uint32_t rptr =
       (tx_fifo_rptr_i < tx_fifo_rptr_q) ? tx_fifo_rptr_i : tx_fifo_rptr_q;
+  // Diagnostic: track the minimum tx_bit_fifo headroom Core 0 observes.
+  int32_t headroom = (int32_t)(tx_fifo_wptr - rptr);
+  if (headroom < tx_bit_min_headroom) tx_bit_min_headroom = headroom;
   if ((tx_fifo_wptr - rptr) < 65536) {
-    generate_next_frame();
+    // Top the ring up to the 65536-symbol watermark in one pass (bounded). A
+    // frame is <= 16384 symbols, so <= 8 iterations reach the watermark and the
+    // ring (131072) can never overflow (65536 + 16383 < 131072).
+    for (int i = 0; i < 8 && (tx_fifo_wptr - rptr) < 65536; i++) {
+      generate_next_frame();
+    }
   }
 }
 
@@ -1554,7 +1585,8 @@ void __not_in_flash_func(loop1)() {
     q_timer = use_oqpsk
                   ? (oqpsk_q_lead ? cycles_per_symbol / 2 : cycles_per_symbol)
                   : cycles_per_symbol;
-    punc_phase = 0;
+    // punc_phase is owned by Core 0 and reset at every frame start in
+    // generate_next_frame(); Core 1 must not write it (removed).
     needs_pattern_init =
         true; // Ask Core 0 to fill FIFO before we prime patterns
     reset_request = false;
@@ -1583,6 +1615,14 @@ void __not_in_flash_func(loop1)() {
     q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q + 2) & TX_FIFO_MASK] << 1;
     q_pattern |= tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK];
     needs_pattern_init = false;
+  }
+
+  // Diagnostic: has the reader overtaken the writer since the last check?
+  // A negative (wrapped) headroom means tx_bit_fifo underflowed and the
+  // emitted symbol stream silently slipped at the fixed symbol clock.
+  if ((int32_t)(tx_fifo_wptr - tx_fifo_rptr_i) < 0 ||
+      (int32_t)(tx_fifo_wptr - tx_fifo_rptr_q) < 0) {
+    tx_bit_underflows++;
   }
 
   int active_chan = (next_buf_to_fill == 0) ? dma_chan0 : dma_chan1;
@@ -1637,14 +1677,18 @@ void __not_in_flash_func(loop1)() {
 #pragma GCC unroll 16
           for (int pair = 0; pair < 16; pair++) {
             if (i_timer == 0) {
-              tx_fifo_rptr_i += 2;
-              i_pattern = ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & TX_FIFO_MASK]) & 31;
+              if ((int32_t)(tx_fifo_wptr - tx_fifo_rptr_i) > 7) {
+                tx_fifo_rptr_i += 2;
+                i_pattern = ((i_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_i + 4) & TX_FIFO_MASK]) & 31;
+              }
               i_timer = cycles_per_symbol;
             }
             i_timer--;
             if (q_timer == 0) {
-              tx_fifo_rptr_q += 2;
-              q_pattern = ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK]) & 31;
+              if ((int32_t)(tx_fifo_wptr - tx_fifo_rptr_q) > 6) {
+                tx_fifo_rptr_q += 2;
+                q_pattern = ((q_pattern << 1) | tx_bit_fifo[(tx_fifo_rptr_q + 4) & TX_FIFO_MASK]) & 31;
+              }
               q_timer = cycles_per_symbol;
             }
             q_timer--;

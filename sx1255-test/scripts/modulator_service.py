@@ -27,6 +27,214 @@ TARGET_FIFO_LEVEL = int(0.80 * MAX_FIFO_SIZE)
 # Will be set after reading status
 DUMMY_PAYLOAD_SIZE = 8  # default CCSDS payload size
 
+# --- TX power knob ---------------------------------------------------------
+# Safe operating bounds (see plans/power_knob_spec.md §C).
+DAC_MIN, DAC_MAX = 0, 3      # TxDacGain, 3 dB steps (never >= 4: datasheet test mode)
+MIX_MIN, MIX_MAX = 6, 14     # TxMixerGain, 2 dB steps; cap at the validated default 14
+REF_DAC, REF_MIX = 3, 14     # level 100 reference (current hardware default)
+SCALE_MIN, SCALE_MAX = 4000, 16000  # digital_scale fine trim (per charge.txt firmware)
+DEFAULT_DAC, DEFAULT_MIX, DEFAULT_SCALE = 3, 14, 12000  # known firmware defaults
+
+
+def power_to_analog(level):
+    """Map a 0..100 power level to (dac_gain_idx, mixer_gain).
+
+    100 -> (3, 14) = current default (max); 0 -> (0, 6) = quietest supported.
+    Monotonic in attenuation; never exceeds (3, 14).
+    """
+    level = max(0, min(100, int(level)))
+    req = (100 - level) * 0.25  # requested attenuation in dB from the reference
+    best = None
+    for dac in range(DAC_MIN, DAC_MAX + 1):
+        dac_att = (REF_DAC - dac) * 3
+        for mix in range(MIX_MIN, MIX_MAX + 1):
+            att = dac_att + (REF_MIX - mix) * 2
+            key = (abs(att - req), -dac, -mix)  # nearest; keep DAC high, then mixer high
+            if best is None or key < best[0]:
+                best = (key, dac, mix)
+    return best[1], best[2]
+
+
+def _status_int(status, key, default):
+    """Parse an integer from a 'q' status value (e.g. 'DAC Gain: 3'), else default."""
+    raw = status.get(key)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).split()[0])
+    except (ValueError, IndexError):
+        return default
+
+
+def resolve_startup_gain(args, status):
+    """Resolve the startup dac/mixer/scale for the pre-binary-mode G command.
+
+    Precedence: explicit --dac/--mixer/--scale win over --power, which wins over
+    the current device values (parsed from the 'q' status), which fall back to
+    the known firmware defaults. Returns (dac, mixer, scale, use_scale, changed).
+    """
+    dac = _status_int(status, "DAC Gain", DEFAULT_DAC)
+    mix = _status_int(status, "Mixer Gain", DEFAULT_MIX)
+    scale = _status_int(status, "Digital Scale", DEFAULT_SCALE)
+
+    if getattr(args, "power", None) is not None:
+        lvl = max(0, min(100, int(args.power)))
+        dac, mix = power_to_analog(lvl)
+
+    if args.dac is not None:
+        if not DAC_MIN <= int(args.dac) <= DAC_MAX:
+            print(f"[WARN] --dac {args.dac} outside {DAC_MIN}..{DAC_MAX}; clamped.")
+        dac = max(DAC_MIN, min(DAC_MAX, int(args.dac)))
+    if args.mixer is not None:
+        if not 0 <= int(args.mixer) <= 15:
+            print(f"[WARN] --mixer {args.mixer} outside 0..15; clamped.")
+        mix = max(0, min(15, int(args.mixer)))
+    if args.scale is not None:
+        if not SCALE_MIN <= int(args.scale) <= SCALE_MAX:
+            print(f"[WARN] --scale {args.scale} outside {SCALE_MIN}..{SCALE_MAX}; clamped.")
+        scale = max(SCALE_MIN, min(SCALE_MAX, int(args.scale)))
+
+    changed = (
+        getattr(args, "power", None) is not None
+        or args.dac is not None
+        or args.mixer is not None
+        or args.scale is not None
+    )
+    return dac, mix, scale, args.scale is not None, changed
+
+
+active_serial = [None]          # current pyserial handle, or None
+streaming = threading.Event()   # set while the binary streaming loop is running
+stream_paused = threading.Event()  # set to pause packet writes during a power change
+stream_paused_ack = threading.Event()  # set by the streaming loop once it observes the pause
+
+CONTROL_HELP = (
+    "Live TX power control:\n"
+    "  power <0..100>            (alias: p) set power level\n"
+    "  g <dac 0-3> <mixer 0-15> [scale 4000-16000]  absolute setter\n"
+    "  status                    (alias: q) print modulator status\n"
+    "  help                      (alias: ?) this help\n"
+    "  quit                      (alias: exit) not supported; use Ctrl-C"
+)
+
+
+def ctrl_send_line(text, need_status=False):
+    """Send one control line to the MCU.
+
+    In binary streaming mode a 300 ms write pause is created and the line is
+    sent with a leading ESC (0x1B); the firmware honours it only after a quiet
+    gap >= 250 ms (see power_knob_spec.md A5). No busy-spin; returns None when
+    the port is down.
+    """
+    ser = active_serial[0]
+    if ser is None or not getattr(ser, "is_open", False):
+        print("[Ctrl] Serial port not available; command dropped.")
+        return None
+    if streaming.is_set():
+        # Pause the streaming loop and WAIT for it to actually observe the pause
+        # (i.e. finish any in-flight packet write) BEFORE starting the 250 ms
+        # quiet-gap timer. Otherwise a packet written mid-race could land
+        # < 250 ms before the ESC, so the firmware would treat the ESC as
+        # payload bytes -> the command is dropped AND the stream is corrupted.
+        stream_paused_ack.clear()
+        stream_paused.set()
+        stream_paused_ack.wait(timeout=1.0)
+        time.sleep(0.30)  # > firmware BINARY_CTL_GAP_MS (250 ms)
+        try:
+            with write_lock:
+                ser.write(("\x1b" + text + "\n").encode("utf-8"))
+                ser.flush()
+        except Exception as e:
+            print(f"[Ctrl] send failed: {e}")
+            return None
+        finally:
+            time.sleep(0.05)
+            stream_paused.clear()
+            stream_paused_ack.clear()
+    else:
+        try:
+            with write_lock:
+                ser.write((text + "\n").encode("utf-8"))
+                ser.flush()
+        except Exception as e:
+            print(f"[Ctrl] send failed: {e}")
+            return None
+    if need_status:
+        try:
+            return status_queue.get(timeout=2.0)
+        except queue.Empty:
+            return b""
+    return b""
+
+
+def handle_control_line(line):
+    parts = line.split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    if cmd in ("help", "?"):
+        print(CONTROL_HELP)
+        return
+    if cmd in ("quit", "exit"):
+        print("[Ctrl] 'quit' is not supported; use Ctrl-C to stop the service.")
+        return
+    if cmd in ("status", "q"):
+        if not ctrl_send_line("q", need_status=True):
+            print("[Ctrl] status unavailable (port down).")
+        else:
+            print("[Ctrl] status requested (see q block above).")
+        return
+    if cmd in ("power", "p"):
+        if len(parts) < 2:
+            print("[Ctrl] usage: power <0..100>")
+            return
+        try:
+            lvl = int(parts[1])
+        except ValueError:
+            print("[Ctrl] power level must be an integer 0..100")
+            return
+        dac, mix = power_to_analog(lvl)
+        if ctrl_send_line(f"G {dac} {mix}") is not None:
+            print(f"[Ctrl] power={max(0, min(100, lvl))} -> dac={dac} mixer={mix}")
+        return
+    if cmd == "g":
+        if len(parts) < 3:
+            print("[Ctrl] usage: g <dac 0-3> <mixer 0-15> [scale 4000-16000]")
+            return
+        try:
+            dac = max(0, min(3, int(parts[1])))
+            mix = max(0, min(15, int(parts[2])))
+            scale = max(4000, min(16000, int(parts[3]))) if len(parts) > 3 else None
+        except ValueError:
+            print("[Ctrl] g expects integers: g <dac> <mixer> [scale]")
+            return
+        text = f"G {dac} {mix}" + (f" {scale}" if scale is not None else "")
+        if ctrl_send_line(text) is not None:
+            print(f"[Ctrl] set dac={dac} mixer={mix}"
+                  + (f" scale={scale}" if scale is not None else ""))
+        return
+    print(f"[Ctrl] unknown command '{cmd}' (try 'help')")
+
+
+def stdin_reader_daemon():
+    """Blocking line reader on stdin. Daemon thread; no busy-spin."""
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except (KeyboardInterrupt, EOFError):
+            return
+        except Exception as e:
+            print(f"[Ctrl] stdin error: {e}")
+            return
+        if not line:  # EOF
+            return
+        line = line.strip()
+        if line:
+            try:
+                handle_control_line(line)
+            except Exception as e:
+                print(f"[Ctrl] command error: {e}")
+
 
 def get_status(ser):
     # Only the reader daemon may read from 'ser'; it routes complete 'q' status
@@ -142,6 +350,9 @@ def serial_worker(args):
     port = args.port
     baud = args.baud
     ser_instance = [None]
+    # Set by the port-lifecycle path to ask the reader to stop before the port
+    # is closed/reopened, so a close cannot race an in-flight readline().
+    stop_event = threading.Event()
 
     def reader_daemon():
         global mcu_fifo_level, mcu_poly
@@ -149,56 +360,71 @@ def serial_worker(args):
         # responses to status_queue and records the poly/RDY tokens for the host.
         in_status = False
         status_buf = []
-        while True:
+        error_logged = False
+        while not stop_event.is_set():
             ser = ser_instance[0]
-            if ser and ser.is_open:
-                try:
-                    line = ser.readline()
-                    if line:
-                        text = line.decode("utf-8", errors="ignore").strip()
-                        if text == "=== Modulator Status ===":
-                            in_status = True
-                            status_buf = [text]
-                        elif in_status:
-                            status_buf.append(text)
-                            # "Core 1 Headroom" is the final line of the 'q' response.
-                            if text.startswith("Core 1 Headroom"):
-                                status_queue.put(
-                                    "\n".join(status_buf).encode("utf-8")
-                                )
-                                in_status = False
-                                status_buf = []
-                        elif "poly toggled to" in text:
-                            # Firmware: "Randomizer poly toggled to 8-bit"
-                            try:
-                                mcu_poly = int(
-                                    text.split("poly toggled to ")[1].split("-bit")[0]
-                                )
-                            except ValueError:
-                                pass
-                        elif text == "RDY":
-                            ready_event.set()
-                        elif text.startswith("[MCU]"):
-                            if "FIFO:" in text:
-                                try:
-                                    mcu_fifo_level = int(
-                                        text.split("FIFO: ")[1].split("/")[0]
-                                    )
-                                except ValueError:
-                                    pass
-                            sys.stdout.write(
-                                f"\r{text} | RT Q: {REAL_TIME_PRIORITY_QUEUE.qsize()} | High Q: {HIGH_PRIORITY_QUEUE.qsize()} | Normal Q: {NORMAL_PRIORITY_QUEUE.qsize()}    "
-                            )
-                            sys.stdout.flush()
-                        else:
-                            sys.stdout.write(f"\n{text}\n")
-                            sys.stdout.flush()
-                except serial.SerialException:
-                    pass
-            else:
+            if ser is None or not ser.is_open:
                 time.sleep(0.1)
+                continue
+            try:
+                line = ser.readline()
+            except (serial.SerialException, OSError, TypeError) as e:
+                # The reconnect path may close/reopen the port while we are
+                # mid-read; on Windows that surfaces as TypeError from byref().
+                # Never let a transient error kill the sole reader.
+                if not error_logged:
+                    print(f"[Serial] Reader transient error: {e}; waiting for port...")
+                    error_logged = True
+                time.sleep(0.1)
+                continue
+            error_logged = False
+            if not line:
+                continue
+            text = line.decode("utf-8", errors="ignore").strip()
+            if text == "=== Modulator Status ===":
+                in_status = True
+                status_buf = [text]
+            elif in_status:
+                status_buf.append(text)
+                # "Core 1 Headroom" is the final line of the 'q' response.
+                if text.startswith("Core 1 Headroom"):
+                    status_queue.put(
+                        "\n".join(status_buf).encode("utf-8")
+                    )
+                    in_status = False
+                    status_buf = []
+            elif "poly toggled to" in text:
+                # Firmware: "Randomizer poly toggled to 8-bit"
+                try:
+                    mcu_poly = int(
+                        text.split("poly toggled to ")[1].split("-bit")[0]
+                    )
+                except ValueError:
+                    pass
+            elif text == "RDY":
+                ready_event.set()
+            elif text.startswith("[MCU]"):
+                if "FIFO:" in text:
+                    try:
+                        mcu_fifo_level = int(
+                            text.split("FIFO: ")[1].split("/")[0]
+                        )
+                    except ValueError:
+                        pass
+                sys.stdout.write(
+                    f"\r{text} | RT Q: {REAL_TIME_PRIORITY_QUEUE.qsize()} | High Q: {HIGH_PRIORITY_QUEUE.qsize()} | Normal Q: {NORMAL_PRIORITY_QUEUE.qsize()}    "
+                )
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(f"\n{text}\n")
+                sys.stdout.flush()
 
-    threading.Thread(target=reader_daemon, daemon=True).start()
+    def start_reader():
+        t = threading.Thread(target=reader_daemon, daemon=True)
+        t.start()
+        return t
+
+    reader_thread = start_reader()
 
     while True:
         try:
@@ -206,6 +432,7 @@ def serial_worker(args):
             ser = serial.Serial(port, baud, timeout=1.0, write_timeout=30.0)
             # Point the reader daemon (sole reader) at this port immediately.
             ser_instance[0] = ser
+            active_serial[0] = ser
 
             # Send 'q' to see if it responds with status (read via the daemon).
             status, response = get_status(ser)
@@ -220,13 +447,24 @@ def serial_worker(args):
                 ser.write(b"m")
                 ser.flush()
             time.sleep(1.5)
+
+            # Stop the reader before closing the port so the close/reopen cannot
+            # race an in-flight readline() (which raises TypeError on Windows).
+            stop_event.set()
+            reader_thread.join(timeout=2.0)
             ser.close()
             ser_instance[0] = None
+            active_serial[0] = None
+            # Reap the reader if it was blocked mid-read when the port closed.
+            reader_thread.join(timeout=2.0)
             time.sleep(0.5)
 
             print(f"[Serial] Reconnecting after MCU restart...")
             ser = serial.Serial(port, baud, timeout=10, write_timeout=30.0)
             ser_instance[0] = ser
+            active_serial[0] = ser
+            stop_event.clear()
+            reader_thread = start_reader()
 
             status, response = get_status(ser)
             retry_count = 0
@@ -416,6 +654,29 @@ def serial_worker(args):
                 pass
             print("[Serial] ------------------------------\n")
 
+            # Pre-binary-mode TX gain/scale: resolve dac/mixer/scale from
+            # device/defaults -> --power -> explicit --dac/--mixer/--scale, then
+            # send exactly ONE 'G' line iff any trigger knob flag was provided.
+            dac, mix, scale, use_scale, gain_changed = resolve_startup_gain(args, status)
+            if gain_changed:
+                g_cmd = f"G {dac} {mix}" + (f" {scale}" if use_scale else "")
+                print(f"[Serial] Setting TX gain: dac={dac}, mixer={mix}"
+                      + (f", scale={scale}" if use_scale else ""))
+                print(f"[Serial]   Sending: {g_cmd}")
+                with write_lock:
+                    ser.write(f"{g_cmd}\n".encode("utf-8"))
+                    ser.flush()
+                time.sleep(0.1)
+                status, _ = get_status(ser)
+                if status:
+                    print(
+                        f"[Serial]   TX DAC Gain: {status.get('DAC Gain', '?')}, "
+                        f"Mixer Gain: {status.get('Mixer Gain', '?')}, "
+                        f"Digital Scale: {status.get('Digital Scale', '?')}"
+                    )
+                else:
+                    print("[Serial]   WARN: no status after G (MCU busy?); continuing.")
+
             with write_lock:
                 ser.write(b"s")
                 ser.flush()
@@ -439,10 +700,16 @@ def serial_worker(args):
                 print("[Serial] Modulator locked into Binary Mode. Stream ready!")
 
             ser_instance[0] = ser
+            active_serial[0] = ser
+            streaming.set()
             keep_alive_seq = 0
             last_user_packet_time = time.time()  # start the idle timer
 
             while True:
+                if stream_paused.is_set():
+                    stream_paused_ack.set()  # tell ctrl_send_line the stream has yielded
+                    time.sleep(0.01)  # live power knob holds the stream briefly
+                    continue
                 apid = None
                 payload = None
                 priority_tag = "REALTIME"
@@ -519,18 +786,30 @@ def serial_worker(args):
             print(f"\n[Fatal Error] {e}")
             os._exit(1)
         except serial.SerialException as e:
+            stop_event.set()
+            reader_thread.join(timeout=2.0)
             ser_instance[0] = None
+            active_serial[0] = None
+            streaming.clear()
             if "ser" in locals() and getattr(ser, "is_open", False):
                 ser.close()
             print(f"\n[Serial] Connection lost: {e}")
             print("[Serial] Attempting to reconnect in 3 seconds...")
             time.sleep(3.0)
+            stop_event.clear()
+            reader_thread = start_reader()
         except Exception as e:
+            stop_event.set()
+            reader_thread.join(timeout=2.0)
             ser_instance[0] = None
+            active_serial[0] = None
+            streaming.clear()
             if "ser" in locals() and getattr(ser, "is_open", False):
                 ser.close()
             print(f"\n[Serial] Unexpected error: {e}")
             time.sleep(3.0)
+            stop_event.clear()
+            reader_thread = start_reader()
 
 
 async def client_handler(reader, writer):
@@ -646,6 +925,34 @@ def main():
         "--fecf", type=int, default=1, choices=[0, 1], help="0=Disable, 1=Enable FECF"
     )
     parser.add_argument(
+        "--power",
+        type=int,
+        default=None,
+        help="Initial TX power level 0..100 (100=max/default, 0=min). "
+             "Omit to leave the hardware value unchanged.",
+    )
+    parser.add_argument(
+        "--dac",
+        type=int,
+        default=None,
+        help="TxDacGain index 0..3 (3 dB steps). Explicitly overrides any "
+             "--power-derived dac. Omit to keep the current/device value.",
+    )
+    parser.add_argument(
+        "--mixer",
+        type=int,
+        default=None,
+        help="TxMixerGain 0..15 (2 dB steps). Explicitly overrides any "
+             "--power-derived mixer. Omit to keep the current/device value.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=int,
+        default=None,
+        help="digital_scale fine trim 4000..16000. Only sent when provided; "
+             "otherwise the firmware leaves digital_scale unchanged.",
+    )
+    parser.add_argument(
         "--rrc",
         type=int,
         choices=[0, 1],
@@ -683,6 +990,9 @@ def main():
 
     serial_thread = threading.Thread(target=serial_worker, args=(args,), daemon=True)
     serial_thread.start()
+
+    stdin_thread = threading.Thread(target=stdin_reader_daemon, daemon=True)
+    stdin_thread.start()
 
     try:
         asyncio.run(start_tcp_server(args.bind, args.tcpport))
