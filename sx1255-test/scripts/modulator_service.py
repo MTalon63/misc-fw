@@ -354,7 +354,15 @@ def serial_worker(args):
     # is closed/reopened, so a close cannot race an in-flight readline().
     stop_event = threading.Event()
 
-    def reader_daemon():
+    # A fresh stop Event is created for every reader_daemon incarnation. Setting
+    # it (and joining the thread) before closing/reopening the port guarantees the
+    # blocked readline() is abandoned before the underlying handles are torn down.
+    # A list is used (matching ser_instance/reader_thread) so start_reader can
+    # replace the Event for each new incarnation without rebinding this slot.
+    reader_stop = [threading.Event()]
+    reader_thread = [None]
+
+    def reader_daemon(stop_event):
         global mcu_fifo_level, mcu_poly
         # Sole thread allowed to read from 'ser'. It routes complete 'q' status
         # responses to status_queue and records the poly/RDY tokens for the host.
